@@ -8,8 +8,6 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- *
- * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/device.h>
@@ -23,7 +21,6 @@
 #include <linux/pmic-voter.h>
 #include <linux/of_batterydata.h>
 #include <linux/ktime.h>
-#include <linux/gpio.h>
 #include "smb5-lib.h"
 #include "smb5-reg.h"
 #include "schgm-flash.h"
@@ -50,21 +47,15 @@
 	|| typec_mode == POWER_SUPPLY_TYPEC_SOURCE_HIGH)	\
 	&& (!chg->typec_legacy || chg->typec_legacy_use_rp_icl))
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 static bool off_charge_flag;
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static bool first_boot_flag;
-#endif
 
 bool smblib_rsbux_low(struct smb_charger *chg, int r_thr);
 static int smblib_get_prop_typec_mode(struct smb_charger *chg);
-#endif
 
 static void update_sw_icl_max(struct smb_charger *chg, int pst);
 static int smblib_get_prop_typec_mode(struct smb_charger *chg);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 static int smblib_get_prop_dfp_mode(struct smb_charger *chg);
-#endif
 
 int smblib_read(struct smb_charger *chg, u16 addr, u8 *val)
 {
@@ -97,6 +88,10 @@ int smblib_batch_write(struct smb_charger *chg, u16 addr, u8 *val,
 
 int smblib_masked_write(struct smb_charger *chg, u16 addr, u8 mask, u8 val)
 {
+	if (addr == TYPE_C_MODE_CFG_REG) {
+		smblib_dbg(chg, PR_MISC, "set 0x1544 mask:0x%x,val:0x%x\n",
+			mask, val);
+	}
 	return regmap_update_bits(chg->regmap, addr, mask, val);
 }
 
@@ -121,25 +116,6 @@ int smblib_get_iio_channel(struct smb_charger *chg, const char *propname,
 
 	return rc;
 }
-
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-static void smblib_wireless_set_enable(struct smb_charger *chg, int enable)
-{
-	int rc = 0;
-	union power_supply_propval val = {0, };
-
-	chg->idtp_psy = power_supply_get_by_name("idt");
-	if (chg->idtp_psy)
-	{
-		val.intval = enable;
-		rc = power_supply_set_property(chg->idtp_psy, POWER_SUPPLY_PROP_PIN_ENABLED, &val);
-		if (rc < 0) {
-			smblib_err(chg, "Could not set charger control limit =%d\n", rc);
-			return;
-		}
-	}
-}
-#endif
 
 #define DIV_FACTOR_MICRO_V_I	1
 #define DIV_FACTOR_MILI_V_I	1000
@@ -523,9 +499,7 @@ enum {
 	FLOAT,
 	HVDCP2,
 	HVDCP3,
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	HVDCP3P5,
-#endif
 	MAX_TYPES
 };
 
@@ -543,7 +517,11 @@ static const struct apsd_result smblib_apsd_results[] = {
 	[CDP] = {
 		.name	= "CDP",
 		.bit	= CDP_CHARGER_BIT,
+#ifdef CONFIG_FACTORY_BUILD
+		.pst	= POWER_SUPPLY_TYPE_USB
+#else
 		.pst	= POWER_SUPPLY_TYPE_USB_CDP
+#endif
 	},
 	[DCP] = {
 		.name	= "DCP",
@@ -570,12 +548,10 @@ static const struct apsd_result smblib_apsd_results[] = {
 		.bit	= DCP_CHARGER_BIT | QC_3P0_BIT,
 		.pst	= POWER_SUPPLY_TYPE_USB_HVDCP_3,
 	},
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	[HVDCP3P5] = {
 		.name	= "HVDCP3P5",
 		.pst	= POWER_SUPPLY_TYPE_USB_HVDCP_3P5,
 	},
-#endif
 };
 
 static const struct apsd_result *smblib_get_apsd_result(struct smb_charger *chg)
@@ -600,6 +576,7 @@ static const struct apsd_result *smblib_get_apsd_result(struct smb_charger *chg)
 			rc);
 		return result;
 	}
+  	smblib_err(chg, "read APSD_RESULT_STATUS stat=0x%x\n", stat);
 	stat &= APSD_RESULT_STATUS_MASK;
 
 	for (i = 0; i < ARRAY_SIZE(smblib_apsd_results); i++) {
@@ -608,24 +585,9 @@ static const struct apsd_result *smblib_get_apsd_result(struct smb_charger *chg)
 	}
 
 	if (apsd_stat & QC_CHARGER_BIT) {
-#ifdef CONFIG_MACH_XIAOMI_NABU
-		if (chg->qc3p5_supported) {
-			if (result == &smblib_apsd_results[HVDCP3]
-					&& chg->qc3p5_authenticated) {
-				result = &smblib_apsd_results[HVDCP3P5];
-			} else if ((result != &smblib_apsd_results[HVDCP3P5])
-					&& (result != &smblib_apsd_results[HVDCP3])) {
-				/* If not QC3 or QC3.5, return QC2 */
-				result = &smblib_apsd_results[HVDCP2];
-			}
-		} else {
-#endif
 		/* since its a qc_charger, either return HVDCP3 or HVDCP2 */
 		if (result != &smblib_apsd_results[HVDCP3])
 			result = &smblib_apsd_results[HVDCP2];
-#ifdef CONFIG_MACH_XIAOMI_NABU
-		}
-#endif
 	}
 
 	return result;
@@ -817,7 +779,6 @@ int smblib_set_dc_suspend(struct smb_charger *chg, bool suspend)
 	return rc;
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 int smblib_get_fastcharge_mode(struct smb_charger *chg)
 {
 	union power_supply_propval pval = {0,};
@@ -924,7 +885,6 @@ int smb5_config_iterm(struct smb_charger *chg, int hi_thresh, int low_thresh)
 	return 0;
 }
 
-#ifdef CONFIG_CHARGER_LN8000
 static int set_ln8000_fv(struct smb_charger *chg) {
 	int rc;
 	union power_supply_propval val;
@@ -951,7 +911,6 @@ static int set_ln8000_fv(struct smb_charger *chg) {
 	}
 	return 0;
 }
-#endif
 
 int smblib_set_fastcharge_mode(struct smb_charger *chg, bool enable)
 {
@@ -962,6 +921,7 @@ int smblib_set_fastcharge_mode(struct smb_charger *chg, bool enable)
 	if (!chg->bms_psy)
 		return 0;
 
+#ifdef CONFIG_BATT_VERIFY_BY_DS28E16
 	rc = power_supply_get_property(chg->bms_psy,
 				POWER_SUPPLY_PROP_AUTHENTIC, &pval);
 	if (rc < 0) {
@@ -970,6 +930,7 @@ int smblib_set_fastcharge_mode(struct smb_charger *chg, bool enable)
 	}
 	if (!pval.intval)
 		enable = false;
+#endif
 
 	/*if soc > 95 do not set fastcharge flag*/
 	rc = power_supply_get_property(chg->bms_psy,
@@ -1007,9 +968,7 @@ int smblib_set_fastcharge_mode(struct smb_charger *chg, bool enable)
 	if (enable) {
 		/* ffc need clear non_fcc_vfloat_voter first */
 		vote(chg->fv_votable, NON_FFC_VFLOAT_VOTER, false, 0);
-#ifdef CONFIG_CHARGER_LN8000
 		set_ln8000_fv(chg);
-#endif
 		rc = power_supply_get_property(chg->bms_psy,
 				POWER_SUPPLY_PROP_FFC_TERMINATION_CURRENT, &pval);
 		if (rc < 0) {
@@ -1039,6 +998,7 @@ set_term:
 	return 0;
 }
 
+#ifdef CONFIG_BATT_VERIFY_BY_DS28E16
 static void smblib_check_batt_authentic(struct smb_charger *chg)
 {
 	int rc = 0;
@@ -1083,7 +1043,6 @@ static int smblib_usb_pd_adapter_allowance_override(struct smb_charger *chg,
 	return rc;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 static int smblib_set_adapter_allowance(struct smb_charger *chg,
 					u8 allowed_voltage)
 {
@@ -1115,7 +1074,6 @@ static int smblib_set_adapter_allowance(struct smb_charger *chg,
 
 	return rc;
 }
-#endif
 
 #define MICRO_5V	5000000
 #define MICRO_9V	9000000
@@ -1401,6 +1359,118 @@ static int smblib_request_dpdm(struct smb_charger *chg, bool enable)
 	return rc;
 }
 
+#define PERIPHERAL_MASK		0xFF
+static u16 peripheral_base;
+static char log[256] = "";
+static char version[8] = "smb:01:";
+static inline void dump_reg(struct smb_charger *chg, u16 addr,
+		const char *name)
+{
+	u8 reg;
+	int rc;
+	char reg_data[50] = "";
+
+	if (NULL == name) {
+		strlcat(log, "\n", sizeof(log));
+		printk(log);
+		return;
+	}
+
+	rc = smblib_read(chg, addr, &reg);
+	if (rc < 0)
+		smblib_err(chg, "Couldn't read OTG status rc=%d\n", rc);
+	/* print one peripheral base registers in one line */
+	if (peripheral_base != (addr & ~PERIPHERAL_MASK)) {
+		peripheral_base = addr & ~PERIPHERAL_MASK;
+		memset(log, 0, sizeof(log));
+		snprintf(reg_data, sizeof(reg_data), "%s%04x ", version, peripheral_base);
+		strlcat(log, reg_data, sizeof(log));
+	}
+	memset(reg_data, 0, sizeof(reg_data));
+	snprintf(reg_data, sizeof(reg_data), "%02x ", reg);
+	strlcat(log, reg_data, sizeof(log));
+
+	smblib_dbg(chg, PR_REGISTER, "%s - %04X = %02X\n",
+							name, addr, reg);
+}
+
+static void dump_regs(struct smb_charger *chg)
+{
+	u16 addr;
+
+	/* charger peripheral */
+	for (addr = 0x6; addr <= 0xE; addr++)
+		dump_reg(chg, CHGR_BASE + addr, "CHGR Status");
+
+	for (addr = 0x10; addr <= 0x1B; addr++)
+		dump_reg(chg, CHGR_BASE + addr, "CHGR INT");
+
+	for (addr = 0x50; addr <= 0x70; addr++)
+		dump_reg(chg, CHGR_BASE + addr, "CHGR Config");
+
+	dump_reg(chg, CHGR_BASE + addr, NULL);
+
+	for (addr = 0x10; addr <= 0x1B; addr++)
+		dump_reg(chg, BATIF_BASE + addr, "BATIF INT");
+
+	for (addr = 0x50; addr <= 0x52; addr++)
+		dump_reg(chg, BATIF_BASE + addr, "BATIF Config");
+
+	for (addr = 0x60; addr <= 0x62; addr++)
+		dump_reg(chg, BATIF_BASE + addr, "BATIF Config");
+
+	for (addr = 0x70; addr <= 0x71; addr++)
+		dump_reg(chg, BATIF_BASE + addr, "BATIF Config");
+
+	dump_reg(chg, BATIF_BASE + addr, NULL);
+
+	for (addr = 0x6; addr <= 0x10; addr++)
+		dump_reg(chg, USBIN_BASE + addr, "USBIN Status");
+
+	for (addr = 0x12; addr <= 0x19; addr++)
+		dump_reg(chg, USBIN_BASE + addr, "USBIN INT ");
+
+	for (addr = 0x40; addr <= 0x43; addr++)
+		dump_reg(chg, USBIN_BASE + addr, "USBIN Cmd ");
+
+	for (addr = 0x58; addr <= 0x70; addr++)
+		dump_reg(chg, USBIN_BASE + addr, "USBIN Config ");
+
+	for (addr = 0x80; addr <= 0x84; addr++)
+		dump_reg(chg, USBIN_BASE + addr, "USBIN Config ");
+
+	dump_reg(chg, USBIN_BASE + addr, NULL);
+
+	for (addr = 0x06; addr <= 0x1B; addr++)
+		dump_reg(chg, TYPEC_BASE + addr, "TYPEC Status");
+
+	for (addr = 0x42; addr <= 0x72; addr++)
+		dump_reg(chg, TYPEC_BASE + addr, "TYPEC Config");
+
+	dump_reg(chg, TYPEC_BASE + 0x44, "TYPEC MODE CFG");
+	dump_reg(chg, TYPEC_BASE + addr, NULL);
+
+	for (addr = 0x6; addr <= 0x10; addr++)
+		dump_reg(chg, MISC_BASE + addr, "MISC Status");
+
+	for (addr = 0x15; addr <= 0x1B; addr++)
+		dump_reg(chg, MISC_BASE + addr, "MISC INT");
+
+	for (addr = 0x51; addr <= 0x62; addr++)
+		dump_reg(chg, MISC_BASE + addr, "MISC Config");
+
+	for (addr = 0x70; addr <= 0x76; addr++)
+		dump_reg(chg, MISC_BASE + addr, "MISC Config");
+
+	for (addr = 0x80; addr <= 0x84; addr++)
+		dump_reg(chg, MISC_BASE + addr, "MISC Config");
+
+	for (addr = 0x90; addr <= 0x94; addr++)
+		dump_reg(chg, MISC_BASE + addr, "MISC Config");
+
+	dump_reg(chg, MISC_BASE + addr, NULL);
+}
+
 void smblib_rerun_apsd(struct smb_charger *chg)
 {
 	int rc;
@@ -1420,9 +1490,7 @@ static const struct apsd_result *smblib_update_usb_type(struct smb_charger *chg)
 	/* if PD is active, APSD is disabled so won't have a valid result */
 	if (chg->pd_active) {
 		chg->real_charger_type = POWER_SUPPLY_TYPE_USB_PD;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		chg->usb_psy_desc.type = POWER_SUPPLY_TYPE_USB_PD;
-#endif
 	} else if (chg->qc3p5_detected) {
 		chg->real_charger_type = POWER_SUPPLY_TYPE_USB_HVDCP_3P5;
 	} else {
@@ -1430,23 +1498,11 @@ static const struct apsd_result *smblib_update_usb_type(struct smb_charger *chg)
 		 * Update real charger type only if its not FLOAT
 		 * detected as as SDP
 		 */
-#ifndef CONFIG_MACH_XIAOMI_NABU
 		if (!(apsd_result->pst == POWER_SUPPLY_TYPE_USB_FLOAT &&
-			chg->real_charger_type == POWER_SUPPLY_TYPE_USB))
-#else
-		if (!(apsd_result->pst == POWER_SUPPLY_TYPE_USB_FLOAT &&
-			chg->real_charger_type == POWER_SUPPLY_TYPE_USB) &&
-			(!chg->qc3p5_supported || chg->qc3p5_auth_complete ||
-			apsd_result->pst != POWER_SUPPLY_TYPE_USB_HVDCP_3))
-#endif
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-		{
-#endif
+			chg->real_charger_type == POWER_SUPPLY_TYPE_USB)) {
 			chg->real_charger_type = apsd_result->pst;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 			chg->usb_psy_desc.type = apsd_result->pst;
 		}
-#endif
 	}
 
 	smblib_dbg(chg, PR_MISC, "APSD=%s PD=%d QC3P5=%d\n",
@@ -1460,19 +1516,17 @@ static int smblib_notifier_call(struct notifier_block *nb,
 	struct power_supply *psy = v;
 	struct smb_charger *chg = container_of(nb, struct smb_charger, nb);
 
+
 	if (!strcmp(psy->desc->name, "bms")) {
 		if (!chg->bms_psy)
 			chg->bms_psy = psy;
-		if (ev == PSY_EVENT_PROP_CHANGED)
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
-		{
+		if (ev == PSY_EVENT_PROP_CHANGED) {
+#ifdef CONFIG_BATT_VERIFY_BY_DS28E16
 			if (!chg->batt_verified)
 				schedule_delayed_work(&chg->batt_verify_update_work, 0);
 #endif
 			schedule_work(&chg->bms_update_work);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
-		} // git don't pick this bracket
-#endif
+		}
 	}
 
 	if (chg->jeita_configured == JEITA_CFG_NONE)
@@ -1600,9 +1654,7 @@ static void smblib_uusb_removal(struct smb_charger *chg)
 
 	del_timer_sync(&chg->apsd_timer);
 	chg->apsd_ext_timeout = false;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	chg->report_usb_absent = false;
-#endif
 
 	/* write back the default FLOAT charger configuration */
 	rc = smblib_masked_write(chg, USBIN_OPTIONS_2_CFG_REG,
@@ -1673,10 +1725,8 @@ void smblib_suspend_on_debug_battery(struct smb_charger *chg)
 int smblib_rerun_apsd_if_required(struct smb_charger *chg)
 {
 	union power_supply_propval val;
-	int rc;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	const struct apsd_result *apsd_result;
-#endif
+	int rc;
 
 	rc = smblib_get_prop_usb_present(chg, &val);
 	if (rc < 0) {
@@ -1684,24 +1734,17 @@ int smblib_rerun_apsd_if_required(struct smb_charger *chg)
 		return rc;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (!val.intval || chg->fake_usb_insertion)
-#else
-	if (!val.intval)
-#endif
 		return 0;
 
-#ifndef CONFIG_MACH_XIAOMI_SM8150
+	/*
 	rc = smblib_request_dpdm(chg, true);
 	if (rc < 0)
 		smblib_err(chg, "Couldn't to enable DPDM rc=%d\n", rc);
-#endif
+	*/
 
 	chg->uusb_apsd_rerun_done = true;
 
-#ifndef CONFIG_MACH_XIAOMI_SM8150
-	smblib_rerun_apsd(chg);
-#else
 	if (!off_charge_flag) {
 		rc = smblib_request_dpdm(chg, true);
 		if (rc < 0)
@@ -1717,8 +1760,6 @@ int smblib_rerun_apsd_if_required(struct smb_charger *chg)
 			smblib_rerun_apsd(chg);
 		}
 	}
-#endif
-
 	return 0;
 }
 
@@ -1739,11 +1780,6 @@ static int set_sdp_current(struct smb_charger *chg, int icl_ua)
 	int rc;
 	u8 icl_options;
 	const struct apsd_result *apsd_result = smblib_get_apsd_result(chg);
-
-	if (icl_ua == USBIN_500MA)
-	{
-		icl_ua = USBIN_900MA;
-	}
 
 	/* power source is SDP */
 	switch (icl_ua) {
@@ -1810,89 +1846,43 @@ int smblib_set_icl_current(struct smb_charger *chg, int icl_ua)
 			    POWER_SUPPLY_TYPEC_SINK_DEBUG_ACCESSORY)
 		return 0;
 
+	pr_info("icl_ua value is: %d\n", icl_ua);
+
 	if (suspend)
 		return smblib_set_usb_suspend(chg, true);
 
 	if (icl_ua == INT_MAX)
 		goto set_mode;
 
-	if (!chg->dcin_uusb_over_gpio_en) {
-		/* configure current */
-		if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-		    && (icl_ua <= USBIN_500MA)
-#endif
-			&& (chg->typec_legacy
-			|| chg->typec_mode == POWER_SUPPLY_TYPEC_SOURCE_DEFAULT
-			|| chg->connector_type ==
-				POWER_SUPPLY_CONNECTOR_MICRO_USB)) {
-			rc = set_sdp_current(chg, icl_ua);
-			if (rc < 0) {
-				smblib_err(chg,
-					"Couldn't set SDP ICL rc=%d\n", rc);
-				goto out;
-			}
-		} else {
-			/*
-			 * Try USB 2.0/3,0 option first on USB path
-			 * when maximum input current limit is 500mA
-			 * or below for better accuracy; in case of error,
-			 * proceed to use USB high-current mode.
-			 */
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-			if (icl_ua < USBIN_100MA) {
-#else
-			if (icl_ua <= USBIN_500MA) {
-#endif
-				rc = set_sdp_current(chg, icl_ua);
-				if (rc >= 0)
-					goto unsuspend;
-			}
-			rc = smblib_set_charge_param(chg,
-					&chg->param.usb_icl, icl_ua);
-			if (rc < 0) {
-				smblib_err(chg, "Couldn't set HC ICL rc=%d\n",
-						rc);
-				goto out;
-			}
-			icl_override = SW_OVERRIDE_HC_MODE;
+	/* configure current */
+	if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB
+		&& (icl_ua <= USBIN_500MA)
+		&& (chg->typec_legacy
+		|| chg->typec_mode == POWER_SUPPLY_TYPEC_SOURCE_DEFAULT
+		|| chg->connector_type == POWER_SUPPLY_CONNECTOR_MICRO_USB)) {
+		rc = set_sdp_current(chg, icl_ua);
+		if (rc < 0) {
+			smblib_err(chg, "Couldn't set SDP ICL rc=%d\n", rc);
+			goto out;
 		}
 	} else {
-		/* configure current */
-		if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB
-			&& (chg->typec_legacy
-			|| chg->typec_mode == POWER_SUPPLY_TYPEC_SOURCE_DEFAULT
-			|| chg->connector_type ==
-				POWER_SUPPLY_CONNECTOR_MICRO_USB)
-			&& (gpio_is_valid(chg->dc_9v_gpio) &&
-			gpio_get_value(chg->dc_9v_gpio) == 0)) {
+		/*
+		 * Try USB 2.0/3,0 option first on USB path when maximum input
+		 * current limit is 500mA or below for better accuracy; in case
+		 * of error, proceed to use USB high-current mode.
+		 */
+		if (icl_ua <= USBIN_500MA) {
 			rc = set_sdp_current(chg, icl_ua);
-			if (rc < 0) {
-				smblib_err(chg, "Couldn't set SDP ICL rc=%d\n",
-						rc);
-				goto out;
-			}
-		} else {
-			/*
-			 * Try USB 2.0/3,0 option first on USB path
-			 * when maximum input current limit is 500mA or
-			 * below for better accuracy; in case
-			 * of error, proceed to use USB high-current mode.
-			 */
-			if (icl_ua <= USBIN_500MA) {
-				rc = set_sdp_current(chg, icl_ua);
-				if (rc >= 0)
-					goto unsuspend;
-			}
-			rc = smblib_set_charge_param(chg,
-				&chg->param.usb_icl, icl_ua);
-			if (rc < 0) {
-				smblib_err(chg,
-					"Couldn't set HC ICL rc=%d\n", rc);
-				goto out;
-			}
-			icl_override = SW_OVERRIDE_HC_MODE;
+			if (rc >= 0)
+				goto unsuspend;
 		}
+
+		rc = smblib_set_charge_param(chg, &chg->param.usb_icl, icl_ua);
+		if (rc < 0) {
+			smblib_err(chg, "Couldn't set HC ICL rc=%d\n", rc);
+			goto out;
+		}
+		icl_override = SW_OVERRIDE_HC_MODE;
 	}
 
 set_mode:
@@ -1903,6 +1893,7 @@ set_mode:
 	}
 
 unsuspend:
+
 	/* unsuspend after configuring current and override */
 	rc = smblib_set_usb_suspend(chg, false);
 	if (rc < 0) {
@@ -2102,7 +2093,6 @@ static int smblib_dc_suspend_vote_callback(struct votable *votable, void *data,
 	return smblib_set_dc_suspend(chg, (bool)suspend);
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 static int smblib_dc_icl_vote_callback(struct votable *votable, void *data,
 			int icl_ua, const char *client)
 {
@@ -2124,6 +2114,7 @@ static int smblib_dc_icl_vote_callback(struct votable *votable, void *data,
 	if (chg->dc_temp_level == 13 || chg->dc_temp_level == 9)
 		Vpsns += PSNS_COMP_UV_FOR_HIGH_THERMAL;
 
+	smblib_dbg(chg, PR_OEM, "set icl_ua %d uA and get Vpsns = %d uV\n", icl_ua, Vpsns);
 	rc = smblib_set_charge_param(chg, &chg->param.dc_icl, Vpsns);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't set DC input current limit rc=%d\n",
@@ -2140,7 +2131,6 @@ suspend:
 	}
 	return rc;
 }
-#endif
 
 static int smblib_awake_vote_callback(struct votable *votable, void *data,
 			int awake, const char *client)
@@ -2377,7 +2367,6 @@ int smblib_vbus_regulator_is_enabled(struct regulator_dev *rdev)
 	return (cmd & OTG_EN_BIT) ? 1 : 0;
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static int smblib_get_batt_voltage_now(struct smb_charger *chg,
 					union power_supply_propval *val)
 {
@@ -2402,7 +2391,6 @@ static void smblib_get_start_vbat_before_step_charge(struct smb_charger *chg)
 
 	pr_err("chg->start_step_vbat: %d\n", chg->start_step_vbat);
 }
-#endif
 
 /********************
  * BATT PSY GETTERS *
@@ -2413,11 +2401,7 @@ int smblib_get_prop_input_suspend(struct smb_charger *chg,
 {
 	val->intval
 		= (get_client_vote(chg->usb_icl_votable, USER_VOTER) == 0)
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		 || get_client_vote(chg->dc_suspend_votable, USER_VOTER);
-#else
-		 && get_client_vote(chg->dc_suspend_votable, USER_VOTER);
-#endif
 	return 0;
 }
 
@@ -2439,7 +2423,6 @@ int smblib_get_prop_batt_present(struct smb_charger *chg,
 	return rc;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 int smblib_get_prop_batt_voltage_now(struct smb_charger *chg,
 					union power_supply_propval *val)
 {
@@ -2486,33 +2469,25 @@ static void smblib_check_usb_status(struct smb_charger *chg)
 		power_supply_changed(chg->batt_psy);
 	}
 }
-#endif
 
 int smblib_get_prop_batt_capacity(struct smb_charger *chg,
-				  union power_supply_propval *val)
+					union power_supply_propval *val)
 {
 	int rc = -EINVAL;
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->fake_capacity >= 0 && chg->fake_capacity <= 100) {
-#else
-	if (chg->fake_capacity >= 0) {
-#endif
 		val->intval = chg->fake_capacity;
 		return 0;
 	}
 
 	rc = smblib_get_prop_from_bms(chg, POWER_SUPPLY_PROP_CAPACITY, val);
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (val->intval == 0)
 		smblib_check_usb_status(chg);
-#endif
 
 	return rc;
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 int smblib_get_prop_batt_capacity_level(struct smb_charger *chg,
                                   union power_supply_propval *val)
 {
@@ -2532,7 +2507,7 @@ int smblib_get_prop_batt_capacity_level(struct smb_charger *chg,
                 val->intval = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
         if (cap >= 100)
                 val->intval = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
-        return rc; // git
+        return rc;
 }
 
 static bool smblib_is_jeita_warm_charging(struct smb_charger *chg)
@@ -2545,16 +2520,16 @@ static bool smblib_is_jeita_warm_charging(struct smb_charger *chg)
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't get usb online property rc=%d\n",
 			rc);
-		return rc; // git
-	} // git
+		return rc;
+	}
 	usb_online = (bool)pval.intval;
 
 	rc = smblib_get_prop_dc_online(chg, &pval);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't get dc online property rc=%d\n",
 			rc);
-		return rc; // git
-	} // git
+		return rc;
+	}
 	dc_online = (bool)pval.intval;
 
 	if (!usb_online && !dc_online)
@@ -2570,69 +2545,6 @@ static bool smblib_is_jeita_warm_charging(struct smb_charger *chg)
 	else
 		return false;
 }
-#endif
-
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-static bool smblib_wireless_to_usb_charging(struct smb_charger *chg,
-	bool usb_online, bool dc_online)
-{
-	if ((usb_online || chg->typec_mode == POWER_SUPPLY_TYPEC_SOURCE_HIGH)
-		&& chg->fake_dc_on) {
-		/* insert usb when wireless charging, set status
-		 * to charge and charger type to DCP
-		 * insert pd charger when wireless charging, power good irq will
-		 * trigger very qucickly difference with other charger type.
-		 */
-		if (!chg->pd_active) {
-			chg->real_charger_type = POWER_SUPPLY_TYPE_USB_DCP;
-			chg->usb_psy_desc.type = POWER_SUPPLY_TYPE_USB_DCP;
-		}
-		return true;
-	} else if (smblib_get_prop_dfp_mode(chg) != POWER_SUPPLY_TYPEC_SINK_AUDIO_ADAPTER
-			&& smblib_get_prop_dfp_mode(chg) != POWER_SUPPLY_TYPEC_NONE
-			&& chg->power_good_en) {
-		smblib_dbg(chg, PR_WLS, "otg mode, set charging when pwr on\n");
-		return true;
-	}
-	else
-		return false;
-}
-
-static bool smblib_is_jeita_warm_charging(struct smb_charger *chg)
-{
-	union power_supply_propval pval = {0, };
-	bool usb_online, dc_online;
-	int rc;
-
-	rc = smblib_get_prop_usb_online(chg, &pval);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't get usb online property rc=%d\n",
-			rc);
-		return rc;
-	}
-	usb_online = (bool)pval.intval;
-
-	rc = smblib_get_prop_dc_online(chg, &pval);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't get dc online property rc=%d\n",
-			rc);
-		return rc;
-	}
-	dc_online = (bool)pval.intval;
-
-	if (!usb_online && !dc_online)
-		return false;
-
-	rc = smblib_get_prop_batt_health(chg, &pval);
-	if (rc < 0)
-		smblib_err(chg, "Couldn't get batt health rc=%d\n", rc);
-
-	if (POWER_SUPPLY_HEALTH_WARM == pval.intval)
-		return true;
-	else
-		return false;
-}
-#endif
 
 static bool is_charging_paused(struct smb_charger *chg)
 {
@@ -2652,20 +2564,16 @@ int smblib_get_prop_batt_status(struct smb_charger *chg,
 				union power_supply_propval *val)
 {
 	union power_supply_propval pval = {0, };
+	union power_supply_propval batt_capa = {0, };
 	bool usb_online, dc_online;
 	u8 stat;
 	int rc, suspend = 0;
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
-	union power_supply_propval batt_capa = {0, };
-#endif
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->use_bq_pump && (get_client_vote_locked(chg->usb_icl_votable,
 					MAIN_CHG_VOTER) == MAIN_CHARGER_STOP_ICL)) {
 		val->intval = POWER_SUPPLY_STATUS_CHARGING;
 		return 0;
-    }
-#endif
+        }
 
 	if (chg->fake_chg_status_on_debug_batt) {
 		rc = smblib_get_prop_from_bms(chg,
@@ -2729,40 +2637,20 @@ int smblib_get_prop_batt_status(struct smb_charger *chg,
 	stat = stat & BATTERY_CHARGER_STATUS_MASK;
 
 	if (!usb_online && !dc_online) {
-#ifndef CONFIG_MACH_XIAOMI_SM8150
-		switch (stat) {
-		case TERMINATE_CHARGE:
-		case INHIBIT_CHARGE:
-			val->intval = POWER_SUPPLY_STATUS_FULL;
-			break;
-		default:
-			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
-			break;
-		}
-#else
 		val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
-#endif
 		return rc;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	rc = smblib_get_prop_batt_health(chg, &pval);
 	if (rc < 0)
 		smblib_err(chg, "Couldn't get batt health rc=%d\n", rc);
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	rc = smblib_get_prop_from_bms(chg,
 			POWER_SUPPLY_PROP_CAPACITY, &batt_capa);
 	if (rc < 0)
 		smblib_err(chg, "Couldn't read SOC value, rc=%d\n", rc);
-#endif
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (get_client_vote_locked(chg->usb_icl_votable, JEITA_VOTER) == 0) {
-#else
-	if ((get_client_vote_locked(chg->usb_icl_votable, JEITA_VOTER) == 0) ||
-		(get_client_vote_locked(chg->dc_suspend_votable, JEITA_VOTER) == 1)) {
-#endif
 		/* show charging when JEITA_VOTER 0mA is vote to improve user experience */
 		if (pval.intval != POWER_SUPPLY_HEALTH_OVERHEAT
 					&& pval.intval != POWER_SUPPLY_HEALTH_COLD) {
@@ -2770,15 +2658,6 @@ int smblib_get_prop_batt_status(struct smb_charger *chg,
 			return 0;
 		}
 	}
-
-#if !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-	if (pval.intval == POWER_SUPPLY_HEALTH_OVERHEAT ||
-				pval.intval == POWER_SUPPLY_HEALTH_COLD) {
-		val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
-		return 0;
-	}
-#endif
-#endif
 
 	switch (stat) {
 	case TRICKLE_CHARGE:
@@ -2789,66 +2668,27 @@ int smblib_get_prop_batt_status(struct smb_charger *chg,
 		break;
 	case TERMINATE_CHARGE:
 	case INHIBIT_CHARGE:
-#ifndef CONFIG_MACH_XIAOMI_SM8150
-		val->intval = POWER_SUPPLY_STATUS_FULL;
-#else
-		if (POWER_SUPPLY_HEALTH_WARM == pval.intval
-#ifdef CONFIG_MACH_XIAOMI_VAYU
-			|| batt_capa.intval <= 98
-#endif
+		if (POWER_SUPPLY_HEALTH_WARM == pval.intval || batt_capa.intval <= 98
 			|| POWER_SUPPLY_HEALTH_OVERHEAT == pval.intval)
 			val->intval = POWER_SUPPLY_STATUS_CHARGING;
-		else {
+		else
 			val->intval = POWER_SUPPLY_STATUS_FULL;
-#if !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-			chg->last_batt_stat = val->intval;
-#endif
-		}
-#endif
 		break;
 	case DISABLE_CHARGE:
 	case PAUSE_CHARGE:
-#ifndef CONFIG_MACH_XIAOMI_SM8150
-		val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
-#else
 		/*
 		 * As from jeita status change, there is very short time not charging,
 		 * to improve user experience, we report charging at this moment.
 		 */
-		if (smblib_is_jeita_warm_charging(chg)
-#if !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-			|| smblib_wireless_to_usb_charging(chg, usb_online, dc_online)
-#endif
-		)
+		if (smblib_is_jeita_warm_charging(chg))
 			val->intval = POWER_SUPPLY_STATUS_CHARGING;
 		else
-			val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
-#endif
+		val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 		break;
 	default:
 		val->intval = POWER_SUPPLY_STATUS_UNKNOWN;
 		break;
 	}
-
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-	if (!usb_online && chg->typec_mode != POWER_SUPPLY_TYPEC_SOURCE_HIGH
-			&& dc_online && chg->fake_dc_on) {
-		/*
-		 * fix insert wireless charger the logo will show twice.
-		 * Also include wireless swith to pd charger, "wireless charger stop" issue.
-		 */
-		if (val->intval == POWER_SUPPLY_STATUS_CHARGING)
-			chg->fake_dc_on = 0;
-		else if (chg->last_batt_stat == POWER_SUPPLY_STATUS_FULL &&
-				val->intval != POWER_SUPPLY_STATUS_CHARGING) {
-			val->intval = POWER_SUPPLY_STATUS_FULL;
-			chg->last_batt_stat = val->intval;
-		}
-		else if (val->intval != POWER_SUPPLY_STATUS_FULL)
-			val->intval = POWER_SUPPLY_STATUS_CHARGING;
-		return 0;
-	}
-#endif
 
 	if (is_charging_paused(chg)) {
 		val->intval = POWER_SUPPLY_STATUS_CHARGING;
@@ -2865,30 +2705,21 @@ int smblib_get_prop_batt_status(struct smb_charger *chg,
 		return 0;
 	}
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	rc = smblib_get_prop_batt_health(chg, &pval);
 	if (rc < 0)
 		smblib_err(chg, "Couldn't get batt health rc=%d\n", rc);
-#endif
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-	if (val->intval != POWER_SUPPLY_STATUS_CHARGING || pval.intval == POWER_SUPPLY_HEALTH_WARM)
-#else
-	if (val->intval != POWER_SUPPLY_STATUS_CHARGING)
-#endif
+	if (val->intval != POWER_SUPPLY_STATUS_CHARGING
+			|| pval.intval == POWER_SUPPLY_HEALTH_WARM)
 		return 0;
 
 	if (!usb_online && dc_online
 		&& chg->fake_batt_status == POWER_SUPPLY_STATUS_FULL) {
 		val->intval = POWER_SUPPLY_STATUS_FULL;
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-		chg->last_batt_stat = val->intval;
-#endif
 		return 0;
 	}
 
-#ifndef CONFIG_MACH_XIAOMI_SM8150
-	rc = smblib_read(chg, BATTERY_CHARGER_STATUS_5_REG, &stat);
+	/* rc = smblib_read(chg, BATTERY_CHARGER_STATUS_5_REG, &stat);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't read BATTERY_CHARGER_STATUS_2 rc=%d\n",
 				rc);
@@ -2899,8 +2730,7 @@ int smblib_get_prop_batt_status(struct smb_charger *chg,
 						ENABLE_FULLON_MODE_BIT;
 
 	if (!stat)
-		val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
-#endif
+		val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING; */
 
 	return 0;
 }
@@ -2936,23 +2766,19 @@ int smblib_get_prop_batt_charge_type(struct smb_charger *chg,
 	return rc;
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static bool is_bq25970_available(struct smb_charger *chg)
 {
 	if (!chg->cp_psy)
 		chg->cp_psy = power_supply_get_by_name("bq2597x-standalone");
 
-#ifdef CONFIG_CHARGER_LN8000
 	if (!chg->cp_psy)
 		chg->cp_psy = power_supply_get_by_name("ln8000");
-#endif
 
 	if (!chg->cp_psy)
 		return false;
 
 	return true;
 }
-#endif
 
 int smblib_get_prop_batt_health(struct smb_charger *chg,
 				union power_supply_propval *val)
@@ -2961,9 +2787,7 @@ int smblib_get_prop_batt_health(struct smb_charger *chg,
 	int rc;
 	int effective_fv_uv;
 	u8 stat;
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	int over_voltage_thr_uv;
-#endif
 
 	rc = smblib_read(chg, BATTERY_CHARGER_STATUS_2_REG, &stat);
 	if (rc < 0) {
@@ -2975,21 +2799,19 @@ int smblib_get_prop_batt_health(struct smb_charger *chg,
 		   stat);
 
 	if (stat & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->use_bq_pump && is_bq25970_available(chg)) {
 				rc = power_supply_get_property(chg->cp_psy,
 					POWER_SUPPLY_PROP_TI_BATTERY_VOLTAGE, &pval);
 				pval.intval = pval.intval * 1000;
-		} else
-#endif
-		rc = smblib_get_prop_from_bms(chg,
+		} else {
+			rc = smblib_get_prop_from_bms(chg,
 				POWER_SUPPLY_PROP_VOLTAGE_NOW, &pval);
+		}
 		if (!rc) {
 			/*
-			 * If Vbatt is within 40mV above Vfloat, then don't
+			 * If Vbatt is within 40mV or 80mV above Vfloat, then don't
 			 * treat it as overvoltage.
 			 */
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 			effective_fv_uv = get_effective_result_locked(chg->fv_votable);
 			/*
 			 * as six pin battery vbat is much higher than cell voltage
@@ -3005,14 +2827,6 @@ int smblib_get_prop_batt_health(struct smb_charger *chg,
 				over_voltage_thr_uv = effective_fv_uv + 40000;
 			}
 			if (pval.intval >= over_voltage_thr_uv) {
-#else
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-			effective_fv_uv = get_effective_result_locked(chg->fv_votable);
-#else
-			effective_fv_uv = get_effective_result(chg->fv_votable);
-#endif
-			if (pval.intval >= effective_fv_uv + 40000) {
-#endif
 				val->intval = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
 				smblib_err(chg, "battery over-voltage vbat_fg = %duV, fv = %duV\n",
 						pval.intval, effective_fv_uv);
@@ -3056,14 +2870,12 @@ int smblib_get_prop_system_temp_level_max(struct smb_charger *chg,
 	return 0;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 int smblib_get_prop_dc_temp_level(struct smb_charger *chg,
 				union power_supply_propval *val)
 {
 	val->intval = chg->dc_temp_level;
 	return 0;
 }
-#endif
 
 int smblib_get_prop_input_current_limited(struct smb_charger *chg,
 				union power_supply_propval *val)
@@ -3131,7 +2943,6 @@ int smblib_get_prop_batt_iterm(struct smb_charger *chg,
 	return rc;
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static int smblib_set_wdog_bark_timer(struct smb_charger *chg,
 					int wdog_timer)
 {
@@ -3148,16 +2959,13 @@ static int smblib_set_wdog_bark_timer(struct smb_charger *chg,
 	}
 	return rc;
 }
-#endif
 
 int smblib_get_prop_batt_charge_done(struct smb_charger *chg,
 					union power_supply_propval *val)
 {
+	union power_supply_propval pval = {0, };
 	int rc;
 	u8 stat;
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
-	union power_supply_propval pval = {0, };
-#endif
 
 	rc = smblib_read(chg, BATTERY_CHARGER_STATUS_1_REG, &stat);
 	if (rc < 0) {
@@ -3169,7 +2977,6 @@ int smblib_get_prop_batt_charge_done(struct smb_charger *chg,
 	stat = stat & BATTERY_CHARGER_STATUS_MASK;
 	val->intval = (stat == TERMINATE_CHARGE);
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	rc = smblib_get_prop_batt_capacity(chg, &pval);
 	if (rc < 0)
 		smblib_err(chg, "Couldn't get batt capacity rc=%d\n", rc);
@@ -3185,17 +2992,10 @@ int smblib_get_prop_batt_charge_done(struct smb_charger *chg,
 		}
 		vote(chg->awake_votable, CHG_AWAKE_VOTER, false, 0);
 	}
-#elif defined(CONFIG_MACH_XIAOMI_SM8150)
-	if (val->intval == 1) {
-		vote(chg->awake_votable, CHG_AWAKE_VOTER, false, 0);
-		vote(chg->awake_votable, DC_AWAKE_VOTER, false, 0);
-	}
-#endif
 
 	return 0;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 int smblib_get_prop_liquid_status(struct smb_charger *chg,
 					union power_supply_propval *val)
 {
@@ -3253,7 +3053,6 @@ bool smblib_support_liquid_feature(struct smb_charger *chg)
 	return chg->support_liquid;
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 int smblib_get_prop_battery_charging_enabled(struct smb_charger *chg,
 					union power_supply_propval *val)
 {
@@ -3312,8 +3111,8 @@ int smblib_get_prop_battery_bq_input_suspend(struct smb_charger *chg,
 
 #define HW_ER_RATIO			2
 #define RF_ADC				1875
-#endif
-#endif
+
+
 
 /***********************
  * BATTERY PSY SETTERS *
@@ -3339,10 +3138,8 @@ int smblib_set_prop_input_suspend(struct smb_charger *chg,
 		return rc;
 	}
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->use_bq_pump)
 		chg->bq_input_suspend = !!(val->intval);
-#endif
 
 	power_supply_changed(chg->batt_psy);
 	return rc;
@@ -3351,7 +3148,6 @@ int smblib_set_prop_input_suspend(struct smb_charger *chg,
 int smblib_set_prop_batt_capacity(struct smb_charger *chg,
 				  const union power_supply_propval *val)
 {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	union power_supply_propval shutdown_delay_en = {0, };
 	/* only enable write reasonable soc value */
 	if (val->intval < 0)
@@ -3359,14 +3155,13 @@ int smblib_set_prop_batt_capacity(struct smb_charger *chg,
 	else if (val->intval > 100)
 		chg->fake_capacity = 100;
 	else
-#endif
-	chg->fake_capacity = val->intval;
+		chg->fake_capacity = val->intval;
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
+	smblib_err(chg, "Set capacity:%d, fake_capacity:%d.\n",
+			val->intval, chg->fake_capacity);
 	power_supply_set_property(chg->bms_psy,
 				POWER_SUPPLY_PROP_SHUTDOWN_DELAY_ENABLE,
 				&shutdown_delay_en);
-#endif
 
 	power_supply_changed(chg->batt_psy);
 
@@ -3387,52 +3182,97 @@ int smblib_set_prop_batt_status(struct smb_charger *chg,
 	return 0;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-#ifdef CONFIG_MACH_XIAOMI_NABU
-int smblib_get_prop_wireless_version(struct smb_charger *chg,
-				     union power_supply_propval *val)
+#define CHARGING_PERIOD_S		600
+#define NOT_CHARGING_PERIOD_S		1200
+static void smblib_reg_work(struct work_struct *work)
 {
-	int rc;
+	struct smb_charger *chg = container_of(work, struct smb_charger,
+							reg_work.work);
+	int rc, usb_present;
+	union power_supply_propval val;
+	int icl_settle, usb_cur_in, usb_vol_in, icl_sts;
+	int charger_type, typec_mode, typec_orientation;
 
-	chg->idtp_psy = power_supply_get_by_name("idt");
-	if (chg->idtp_psy) {
-		chg->wls_chip_psy = chg->idtp_psy;
-	} else {
-		chg->wip_psy = power_supply_get_by_name("rx1619");
-		if (chg->wip_psy)
-			chg->wls_chip_psy = chg->wip_psy;
-		else
-			return -EINVAL;
+	dump_regs(chg);
+	rc = smblib_get_prop_usb_present(chg, &val);
+	if (rc < 0) {
+		pr_err("Couldn't get usb present rc=%d\n", rc);
+		schedule_delayed_work(&chg->reg_work,
+				NOT_CHARGING_PERIOD_S * HZ);
+		return;
 	}
+	usb_present = val.intval;
 
-	if (chg->wls_chip_psy)
-		rc = power_supply_get_property(chg->wls_chip_psy,
-				       POWER_SUPPLY_PROP_WIRELESS_VERSION, val);
-	return rc;
-}
+	smblib_dbg(chg, PR_OEM, "Awake vote value is %d voted by %s\n",
+					get_effective_result(chg->awake_votable),
+					get_effective_client(chg->awake_votable));
 
-int smblib_get_prop_wireless_fw_version(struct smb_charger *chg,
-				     union power_supply_propval *val)
-{
-	int rc;
+	if (usb_present) {
+		smblib_dbg(chg, PR_OEM, "ICL vote value is %d voted by %s\n",
+					get_effective_result(chg->usb_icl_votable),
+					get_effective_client(chg->usb_icl_votable));
+		smblib_dbg(chg, PR_OEM, "FCC vote value is %d voted by %s\n",
+					get_effective_result(chg->fcc_votable),
+					get_effective_client(chg->fcc_votable));
+		smblib_dbg(chg, PR_OEM, "FV vote value is %d voted by %s\n",
+					get_effective_result(chg->fv_votable),
+					get_effective_client(chg->fv_votable));
 
-	chg->idtp_psy = power_supply_get_by_name("idt");
-	if (chg->idtp_psy) {
-		chg->wls_chip_psy = chg->idtp_psy;
+		power_supply_get_property(chg->usb_psy,
+					POWER_SUPPLY_PROP_INPUT_CURRENT_NOW,
+					&val);
+		usb_cur_in = val.intval;
+
+		power_supply_get_property(chg->usb_psy,
+					POWER_SUPPLY_PROP_VOLTAGE_NOW,
+					&val);
+		usb_vol_in = val.intval;
+
+		power_supply_get_property(chg->usb_psy,
+					POWER_SUPPLY_PROP_CURRENT_MAX,
+					&val);
+		icl_settle = val.intval;
+
+		power_supply_get_property(chg->usb_psy,
+					POWER_SUPPLY_PROP_REAL_TYPE,
+					&val);
+		charger_type = val.intval;
+
+		power_supply_get_property(chg->usb_psy,
+					POWER_SUPPLY_PROP_TYPEC_MODE,
+					&val);
+		typec_mode = val.intval;
+
+		power_supply_get_property(chg->usb_psy,
+					POWER_SUPPLY_PROP_TYPEC_CC_ORIENTATION,
+					&val);
+		typec_orientation = val.intval;
+
+		smblib_dbg(chg, PR_OEM,
+					"ICL settle value[%d], usbin adc current[%d], vbusin adc vol[%d]\n",
+					icl_settle, usb_cur_in, usb_vol_in);
+		if (!chg->usb_main_psy) {
+			chg->usb_main_psy = power_supply_get_by_name("main");
+		}
+		else {
+			power_supply_get_property(chg->usb_main_psy,
+					POWER_SUPPLY_PROP_INPUT_CURRENT_SETTLED,
+					&val);
+			icl_sts = val.intval;
+			smblib_dbg(chg, PR_OEM, "AICL_STS[%d]\n", icl_sts);
+		}
+
+		smblib_dbg(chg, PR_OEM,
+					"Type-C orientation[%d], Type-C mode[%d], Real Charger Type[%d]\n",
+					typec_orientation, typec_mode, charger_type);
+
+		schedule_delayed_work(&chg->reg_work,
+				CHARGING_PERIOD_S * HZ);
 	} else {
-		chg->wip_psy = power_supply_get_by_name("rx1619");
-		if (chg->wip_psy)
-			chg->wls_chip_psy = chg->wip_psy;
-		else
-			return -EINVAL;
+		schedule_delayed_work(&chg->reg_work,
+				NOT_CHARGING_PERIOD_S * HZ);
 	}
-
-	if (chg->wls_chip_psy)
-		rc = power_supply_get_property(chg->wls_chip_psy,
-				       POWER_SUPPLY_PROP_WIRELESS_FW_VERSION, val);
-	return rc;
 }
-#endif
 
 #define ADAPTER_NONE 0x00
 #define ADAPTER_SDP  0x01
@@ -3445,12 +3285,11 @@ int smblib_get_prop_wireless_fw_version(struct smb_charger *chg,
 #define ADAPTER_XIAOMI_QC3    0x09
 #define ADAPTER_XIAOMI_PD     0x0a
 #define ADAPTER_ZIMI_CAR_POWER    0x0b
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 #define ADAPTER_XIAOMI_PD_40W     0x0c
 #define ADAPTER_VOICE_BOX     0x0d
 #define ADAPTER_XIAOMI_PD_50W 0x0e
-#endif
 
+#ifdef CONFIG_THERMAL
 static int smblib_dc_therm_charging(struct smb_charger *chg,
 					int temp_level)
 {
@@ -3474,11 +3313,9 @@ static int smblib_dc_therm_charging(struct smb_charger *chg,
 		switch (pval.intval) {
 		case ADAPTER_XIAOMI_QC3:
 		case ADAPTER_ZIMI_CAR_POWER:
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		case ADAPTER_XIAOMI_PD_40W:
 		case ADAPTER_XIAOMI_PD_50W:
 		case ADAPTER_VOICE_BOX:
-#endif
 			thermal_icl_ua = chg->thermal_mitigation_dc[temp_level];
 			break;
 		case ADAPTER_QC2:
@@ -3515,7 +3352,7 @@ static int smblib_dc_therm_charging(struct smb_charger *chg,
 
 	return rc;
 }
-
+#endif
 int smblib_set_prop_dc_temp_level(struct smb_charger *chg,
 				const union power_supply_propval *val)
 {
@@ -3552,11 +3389,19 @@ int smblib_set_prop_dc_temp_level(struct smb_charger *chg,
 	if (chg->dc_temp_level == 0)
 		return vote(chg->dc_icl_votable, THERMAL_DAEMON_VOTER, false, 0);
 
+	smblib_dbg(chg, PR_OEM, "thermal level:%d, batt temp:%d, thermal_levels:%d dc_present=%d\n",
+			val->intval, batt_temp.intval, chg->dc_thermal_levels,dc_present.intval);
+#ifdef CONFIG_THERMAL
 	smblib_dc_therm_charging(chg, val->intval);
+#else
+	vote(chg->dc_icl_votable, THERMAL_DAEMON_VOTER, true,
+		chg->thermal_mitigation_dc[chg->dc_temp_level]);
 
+#endif
 	return 0;
 }
 
+#ifdef CONFIG_THERMAL
 static int smblib_therm_charging(struct smb_charger *chg)
 {
 	int thermal_icl_ua = 0;
@@ -3571,44 +3416,32 @@ static int smblib_therm_charging(struct smb_charger *chg)
 		thermal_icl_ua = chg->thermal_mitigation_qc2[chg->system_temp_level];
 		break;
 	case POWER_SUPPLY_TYPE_USB_HVDCP_3:
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->use_bq_pump) {
 			thermal_fcc_ua =
 				chg->thermal_fcc_qc3_cp[chg->system_temp_level];
 		} else {
-#endif
 			if (chg->cp_reason == POWER_SUPPLY_CP_HVDCP3) {
 				if (chg->is_qc_class_a)
 					thermal_fcc_ua =
 						chg->thermal_fcc_qc3_cp[chg->system_temp_level];
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 				else if (chg->temp_27W_enable)
 					thermal_fcc_ua =
 						chg->thermal_fcc_qc3_classb_cp[chg->system_temp_level];
-#endif
 				else
 					thermal_fcc_ua =
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 						chg->thermal_fcc_qc3_cp[chg->system_temp_level];
-#else
-						chg->thermal_fcc_qc3_classb_cp[chg->system_temp_level];
-#endif
+
 			} else {
 				thermal_fcc_ua =
 					chg->thermal_fcc_qc3_normal[chg->system_temp_level];
 			}
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		}
-#endif
 		break;
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	case POWER_SUPPLY_TYPE_USB_HVDCP_3P5:
 		thermal_fcc_ua =
 				chg->thermal_fcc_qc3_cp[chg->system_temp_level];
 		break;
-#endif
 	case POWER_SUPPLY_TYPE_USB_PD:
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->use_bq_pump) {
 			if (chg->pps_thermal_level < 0)
 					chg->pps_thermal_level = chg->system_temp_level;
@@ -3616,7 +3449,6 @@ static int smblib_therm_charging(struct smb_charger *chg)
 			thermal_fcc_ua =
 					chg->thermal_fcc_pps_cp[chg->pps_thermal_level];
 		} else {
-#endif
 			if (chg->cp_reason == POWER_SUPPLY_CP_PPS) {
 				thermal_fcc_ua =
 					chg->thermal_fcc_pps_cp[chg->system_temp_level];
@@ -3648,9 +3480,7 @@ static int smblib_therm_charging(struct smb_charger *chg)
 					thermal_icl_ua =
 							chg->thermal_mitigation_pd_base[chg->system_temp_level];
 			}
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		}
-#endif
 		break;
 	case POWER_SUPPLY_TYPE_USB_DCP:
 	default:
@@ -3674,12 +3504,8 @@ static int smblib_therm_charging(struct smb_charger *chg)
 		pr_info("thermal_fcc_ua is %d\n", thermal_fcc_ua);
 
 		if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP_3
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 				|| chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP_3P5
 				|| ((chg->cp_reason == POWER_SUPPLY_CP_PPS || chg->use_bq_pump)
-#else
-				|| (chg->cp_reason == POWER_SUPPLY_CP_PPS
-#endif
 				&& chg->real_charger_type == POWER_SUPPLY_TYPE_USB_PD)) {
 			/* if use qc3 or pps charge with cp, also limit icl when high level */
 			if (chg->system_temp_level >= ICL_LIMIT_LEVEL_THR)
@@ -3722,8 +3548,8 @@ static int smblib_therm_charging(struct smb_charger *chg)
 
 	return rc;
 }
+#endif
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static void smblib_thermal_setting_work(struct work_struct *work)
 {
 	struct smb_charger *chg = container_of(work, struct smb_charger,
@@ -3746,25 +3572,24 @@ static void smblib_thermal_setting_work(struct work_struct *work)
 	if (chg->pps_thermal_level != chg->system_temp_level)
 		schedule_delayed_work(&chg->thermal_setting_work, 3 * HZ);
 }
-#endif
-#endif
 
 int smblib_set_prop_system_temp_level(struct smb_charger *chg,
 				const union power_supply_propval *val)
 {
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	int rc;
 	union power_supply_propval batt_temp = {0, };
-#endif
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	rc = smblib_get_prop_from_bms(chg,
 				POWER_SUPPLY_PROP_TEMP, &batt_temp);
 	if (rc < 0) {
 		pr_err("Couldn't get batt temp rc=%d\n", rc);
 		return -EINVAL;
 	}
-#endif
+
+	smblib_dbg(chg, PR_OEM, "thermal level:%d, batt temp:%d, thermal_levels:%d "
+			"chg->system_temp_level:%d, charger_type:%d\n",
+			val->intval, batt_temp.intval, chg->thermal_levels,
+			chg->system_temp_level, chg->real_charger_type);
 
 	if (val->intval < 0)
 		return -EINVAL;
@@ -3777,33 +3602,23 @@ int smblib_set_prop_system_temp_level(struct smb_charger *chg,
 
 	chg->system_temp_level = val->intval;
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (!chg->use_bq_pump) {
 		if (chg->system_temp_level >= (chg->thermal_levels - 1)) {
 			if (!chg->cp_disable_votable)
 				chg->cp_disable_votable = find_votable("CP_DISABLE");
 			if (chg->cp_disable_votable)
 				vote(chg->cp_disable_votable, THERMAL_DAEMON_VOTER, true, 0);
-
 			return vote(chg->chg_disable_votable,
 				THERMAL_DAEMON_VOTER, true, 0);
 		}
 	}
-#elif defined(CONFIG_MACH_XIAOMI_SM8150)
-	if (chg->system_temp_level >= (chg->thermal_levels - 1))
-		return vote(chg->chg_disable_votable,
-			THERMAL_DAEMON_VOTER, true, 0);
-#else
-	if (chg->system_temp_level == chg->thermal_levels)
-		return vote(chg->chg_disable_votable,
-			THERMAL_DAEMON_VOTER, true, 0);
-#endif
 
 	vote(chg->chg_disable_votable, THERMAL_DAEMON_VOTER, false, 0);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
+
 	if (!chg->use_bq_pump && chg->cp_disable_votable)
 		vote(chg->cp_disable_votable, THERMAL_DAEMON_VOTER, false, 0);
 
+#ifdef CONFIG_THERMAL
 	if (chg->use_bq_pump
 			&& chg->real_charger_type == POWER_SUPPLY_TYPE_USB_PD) {
 		if (chg->pps_fcc_therm_work_disabled) {
@@ -3813,8 +3628,6 @@ int smblib_set_prop_system_temp_level(struct smb_charger *chg,
 			schedule_delayed_work(&chg->thermal_setting_work, 3 * HZ);
 	} else
 		smblib_therm_charging(chg);
-#elif defined(CONFIG_MACH_XIAOMI_SM8150)
-	smblib_therm_charging(chg);
 #else
 	if (chg->system_temp_level == 0)
 		return vote(chg->fcc_votable, THERMAL_DAEMON_VOTER, false, 0);
@@ -3822,7 +3635,6 @@ int smblib_set_prop_system_temp_level(struct smb_charger *chg,
 	vote(chg->fcc_votable, THERMAL_DAEMON_VOTER, true,
 			chg->thermal_mitigation[chg->system_temp_level]);
 #endif
-
 	return 0;
 }
 
@@ -3839,14 +3651,12 @@ int smblib_set_prop_rechg_soc_thresh(struct smb_charger *chg,
 	int rc;
 	u8 new_thr = DIV_ROUND_CLOSEST(val->intval * 255, 100);
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	/*
 	 * As DIV_ROUND_CLOSEST cal cause new_thr to 252, we add 1 more to
 	 * improve recharging UI soc still to 100% to improve user experience.
 	 */
 	if (val->intval == RECHARGE_SOC_THR)
 		new_thr += 1;
-#endif
 
 	rc = smblib_write(chg, CHARGE_RCHG_SOC_THRESHOLD_CFG_REG,
 			new_thr);
@@ -3984,13 +3794,11 @@ static void smblib_hvdcp_adaptive_voltage_change(struct smb_charger *chg)
 	u8 stat;
 
 	if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP) {
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		if (chg->qc2_unsupported) {
 			smblib_hvdcp_set_fsw(chg, QC_5V_BIT);
 			power_supply_changed(chg->usb_main_psy);
 			return;
 		}
-#endif
 		rc = smblib_read(chg, QC_CHANGE_STATUS_REG, &stat);
 		if (rc < 0) {
 			smblib_err(chg,
@@ -4018,22 +3826,17 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 	union power_supply_propval pval;
 	u8 stat;
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->use_bq_pump) {
 		pr_info("dp_dm is controled by our self\n");
 		return rc;
 	}
-#endif
 
 	/* if raise_vbus work is running, ignore dp_dm pulses */
 	if (chg->raise_vbus_to_detect)
 		return rc;
-#endif
 
 	switch (val) {
 	case POWER_SUPPLY_DP_DM_DP_PULSE:
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		/*
 		 * if hvdcp_opti wrongly send more than 30 dp pulse(11V) to smb5,
 		 * ignore them to allow maxium vbus as 11V, as charge pump do not
@@ -4041,7 +3844,6 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 		 */
 		if (chg->pulse_cnt > MAX_PLUSE_COUNT_ALLOWED)
 			return rc;
-#endif
 		/*
 		 * Pre-emptively increment pulse count to enable the setting
 		 * of FSW prior to increasing voltage.
@@ -4065,7 +3867,6 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 
 		smblib_dbg(chg, PR_PARALLEL, "DP_DM_DP_PULSE rc=%d cnt=%d\n",
 				rc, chg->pulse_cnt);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		/*
 		 * if use class_a qc, and slave ic is charge pump, should limit
 		 * maxium icl to 1.9A, as VBUS will raise to about 9V to 9.8V,
@@ -4079,7 +3880,6 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 				chg->high_vbus_detected = true;
 			}
 		}
-#endif
 		break;
 	case POWER_SUPPLY_DP_DM_DM_PULSE:
 		rc = smblib_dm_pulse(chg);
@@ -4087,7 +3887,6 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 			chg->pulse_cnt--;
 		smblib_dbg(chg, PR_PARALLEL, "DP_DM_DM_PULSE rc=%d cnt=%d\n",
 				rc, chg->pulse_cnt);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		/*
 		 * if use class_a qc, and slave ic is charge pump, should restore
 		 * icl to 2.4A when charge pump is not working for class_a qc
@@ -4100,7 +3899,6 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 				chg->high_vbus_detected = false;
 			}
 		}
-#endif
 		break;
 	case POWER_SUPPLY_DP_DM_ICL_DOWN:
 		target_icl_ua = get_effective_result(chg->usb_icl_votable);
@@ -4134,20 +3932,16 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 		break;
 	case POWER_SUPPLY_DP_DM_FORCE_5V:
 		rc = smblib_force_vbus_voltage(chg, FORCE_5V_BIT);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		chg->pulse_cnt = 0;
-#endif
 		if (rc < 0)
 			pr_err("Failed to force 5V\n");
 		break;
 	case POWER_SUPPLY_DP_DM_FORCE_9V:
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		/* we use our own qc2 method to raise to 9V, so just return here */
 		return 0;
 
 		if (chg->qc2_unsupported)
 			return 0;
-#endif
 
 		if (chg->qc2_unsupported_voltage == QC2_NON_COMPLIANT_9V) {
 			smblib_err(chg, "Couldn't set 9V: unsupported\n");
@@ -4172,19 +3966,15 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 		rc = smblib_force_vbus_voltage(chg, FORCE_9V_BIT);
 		if (rc < 0)
 			pr_err("Failed to force 9V\n");
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 				HVDCP2_CURRENT_UA);
-#endif
 		break;
 	case POWER_SUPPLY_DP_DM_FORCE_12V:
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		/* we use our own qc2 method to raise to 9V, so just return here */
 		return 0;
 
 		if (chg->qc2_unsupported)
 			return 0;
-#endif
 
 		if (chg->qc2_unsupported_voltage == QC2_NON_COMPLIANT_12V) {
 			smblib_err(chg, "Couldn't set 12V: unsupported\n");
@@ -4209,10 +3999,8 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 		rc = smblib_force_vbus_voltage(chg, FORCE_12V_BIT);
 		if (rc < 0)
 			pr_err("Failed to force 12V\n");
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 				HVDCP2_CURRENT_UA);
-#endif
 		break;
 	case POWER_SUPPLY_DP_DM_CONFIRMED_HVDCP3P5:
 		chg->qc3p5_detected = true;
@@ -4226,13 +4014,9 @@ int smblib_dp_dm(struct smb_charger *chg, int val)
 	return rc;
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 int smblib_dp_dm_bq(struct smb_charger *chg, int val)
 {
 	int rc = 0;
-#ifdef CONFIG_MACH_XIAOMI_NABU
-	int qc3p5_dp_cnt = 0;
-#endif
 
 	/* if raise_vbus work is running, ignore dp_dm pulses */
 	if (chg->raise_vbus_to_detect)
@@ -4245,55 +4029,18 @@ int smblib_dp_dm_bq(struct smb_charger *chg, int val)
 		 * ignore them to allow maxium vbus as 11V, as charge pump do not
 		 * need the vin more than 11V, and protect the device.
 		 */
-		if (chg->pulse_cnt > MAX_PLUSE_COUNT_ALLOWED
-#ifdef CONFIG_MACH_XIAOMI_NABU
-			&& chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP_3
-#endif
-		) {
+		if (chg->pulse_cnt > MAX_PLUSE_COUNT_ALLOWED)
 			return rc;
-#ifdef CONFIG_MACH_XIAOMI_NABU
-		} else if (chg->qc3p5_supported
-				&& chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP_3P5) {
-			if (chg->pulse_cnt > MAX_QC3P5_PLUSE_COUNT_ALLOWED)
-				return rc;
-			else if (chg->pulse_cnt >= QC3P5_DP_RAPIDLY_TUNE_ALLOWED)
-				chg->qc3p5_dp_tune_rapidly = false;
-			else
-				chg->qc3p5_dp_tune_rapidly = true;
-#endif
-		}
-
 		/*
 		 * Pre-emptively increment pulse count to enable the setting
 		 * of FSW prior to increasing voltage.
 		 */
-#ifdef CONFIG_MACH_XIAOMI_NABU
-		if (chg->qc3p5_dp_tune_rapidly)
-			chg->pulse_cnt += QC3P5_DP_RAPIDLY_TUNE_PULSE;
-		else
-			chg->pulse_cnt++;
-#else
 		chg->pulse_cnt++;
-#endif
 
 		rc = smblib_hvdcp3_set_fsw(chg);
 		if (rc < 0)
 			smblib_err(chg, "Couldn't set QC3.0 Fsw rc=%d\n", rc);
 
-#ifdef CONFIG_MACH_XIAOMI_NABU
-		if (chg->qc3p5_dp_tune_rapidly) {
-			for (qc3p5_dp_cnt = 1; qc3p5_dp_cnt <= QC3P5_DP_RAPIDLY_TUNE_PULSE; qc3p5_dp_cnt++) {
-				rc = smblib_dp_pulse(chg);
-				if (rc < 0) {
-					smblib_err(chg, "Couldn't increase pulse count rc=%d\n", rc);
-					chg->pulse_cnt--;
-				}
-				smblib_dbg(chg, PR_PARALLEL, "DP_DM_DP_PULSE rapidly rc=%d cnt=%d\n",
-						rc, chg->pulse_cnt - QC3P5_DP_RAPIDLY_TUNE_PULSE + qc3p5_dp_cnt);
-				usleep_range(8000, 8010);	// delay 8ms
-			}
-		} else {
-#endif
 		rc = smblib_dp_pulse(chg);
 		if (rc < 0) {
 			smblib_err(chg, "Couldn't increase pulse count rc=%d\n",
@@ -4304,9 +4051,6 @@ int smblib_dp_dm_bq(struct smb_charger *chg, int val)
 			 */
 			chg->pulse_cnt--;
 		}
-#ifdef CONFIG_MACH_XIAOMI_NABU
-		}
-#endif
 
 		smblib_dbg(chg, PR_PARALLEL, "DP_DM_DP_PULSE rc=%d cnt=%d\n",
 				rc, chg->pulse_cnt);
@@ -4358,7 +4102,6 @@ int smblib_dp_dm_bq(struct smb_charger *chg, int val)
 
 	return rc;
 }
-#endif
 
 int smblib_disable_hw_jeita(struct smb_charger *chg, bool disable)
 {
@@ -4382,38 +4125,6 @@ int smblib_disable_hw_jeita(struct smb_charger *chg, bool disable)
 
 	return 0;
 }
-
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-int smblib_get_prop_wireless_version(struct smb_charger *chg,
-				     union power_supply_propval *val)
-{
-	int rc;
-
-/*
-	if (!chg->idtp_psy) {
-		chg->idtp_psy = power_supply_get_by_name("idt");
-		if (!chg->idtp_psy)
-			return -EINVAL;
-	}
-*/
-
-	chg->idtp_psy = power_supply_get_by_name("idt");
-	if (chg->idtp_psy)
-		chg->wls_chip_psy = chg->idtp_psy;
-	else {
-		chg->wip_psy = power_supply_get_by_name("rx1618");
-		if (chg->wip_psy)
-			chg->wls_chip_psy = chg->wip_psy;
-		else
-			return -EINVAL;
-	}
-
-	if (chg->wls_chip_psy)
-		rc = power_supply_get_property(chg->wls_chip_psy,
-				       POWER_SUPPLY_PROP_WIRELESS_VERSION, val);
-	return rc;
-}
-#endif
 
 static int smblib_set_sw_thermal_regulation(struct smb_charger *chg,
 						bool enable)
@@ -4540,8 +4251,6 @@ static int smblib_update_thermal_readings(struct smb_charger *chg)
 
 #define THERM_REG_RECHECK_DELAY_1S	1000	/* 1 sec */
 #define THERM_REG_RECHECK_DELAY_8S	8000	/* 8 sec */
-
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static void smblib_report_soc_decimal_work(struct work_struct *work)
 {
 	struct smb_charger *chg = container_of(work, struct smb_charger,
@@ -4555,7 +4264,7 @@ static void smblib_report_soc_decimal_work(struct work_struct *work)
 		power_supply_changed(chg->bms_psy);
 	}
 }
-#endif
+
 
 static int smblib_process_thermal_readings(struct smb_charger *chg)
 {
@@ -4660,10 +4369,8 @@ out:
 		 */
 		if (chg->thermal_status == TEMP_SHUT_DOWN_SMB)
 			goto exit;
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->use_bq_pump)
 			chg->bq_input_suspend = !!suspend_input;
-#endif
 
 		/* Suspend input if SHDN threshold reached */
 		vote(chg->dc_suspend_votable, SW_THERM_REGULATION_VOTER,
@@ -4744,12 +4451,9 @@ int smblib_get_prop_dc_present(struct smb_charger *chg,
 int smblib_get_prop_dc_online(struct smb_charger *chg,
 			       union power_supply_propval *val)
 {
-	int rc = 0;
+	int dc_present, rc = 0;
 	u8 stat;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-	int dc_present;
 	union power_supply_propval pval = {0, };
-#endif
 
 	if (chg->chg_param.smb_version == PMI632_SUBTYPE) {
 		val->intval = 0;
@@ -4761,17 +4465,12 @@ int smblib_get_prop_dc_online(struct smb_charger *chg,
 		return rc;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (is_client_vote_enabled_locked(chg->dc_suspend_votable,
-#else
-	if (is_client_vote_enabled(chg->dc_suspend_votable,
-#endif
 						CHG_TERMINATION_VOTER)) {
 		rc = smblib_get_prop_dc_present(chg, val);
 		return rc;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	rc = smblib_get_prop_dc_present(chg, &pval);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't get usb present rc = %d\n", rc);
@@ -4791,7 +4490,6 @@ int smblib_get_prop_dc_online(struct smb_charger *chg,
 		val->intval = true;
 		return rc;
 	}
-#endif
 
 	rc = smblib_read(chg, POWER_PATH_STATUS_REG, &stat);
 	if (rc < 0) {
@@ -4799,10 +4497,6 @@ int smblib_get_prop_dc_online(struct smb_charger *chg,
 			rc);
 		return rc;
 	}
-#if !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-	smblib_dbg(chg, PR_REGISTER, "POWER_PATH_STATUS = 0x%02x\n",
-		   stat);
-#endif
 
 	val->intval = (stat & USE_DCIN_BIT) &&
 		      (stat & VALID_INPUT_POWER_SOURCE_STS_BIT);
@@ -4810,7 +4504,6 @@ int smblib_get_prop_dc_online(struct smb_charger *chg,
 	return rc;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 int smblib_set_prop_wireless_wakelock(struct smb_charger *chg,
 				const union power_supply_propval *val)
 {
@@ -4824,17 +4517,12 @@ int smblib_set_prop_wireless_wakelock(struct smb_charger *chg,
 	}
 	return 0;
 }
-#endif
 
 int smblib_get_prop_dc_current_max(struct smb_charger *chg,
 				    union power_supply_propval *val)
 {
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	val->intval = get_effective_result_locked(chg->dc_icl_votable);
 	return 0;
-#else
-	return smblib_get_charge_param(chg, &chg->param.dc_icl, &val->intval);
-#endif
 }
 
 int smblib_get_prop_dc_voltage_max(struct smb_charger *chg,
@@ -4859,7 +4547,7 @@ int smblib_get_prop_dc_voltage_now(struct smb_charger *chg,
 				POWER_SUPPLY_PROP_INPUT_VOLTAGE_REGULATION,
 				val);
 	if (rc < 0) {
-		dev_err(chg->dev, "Couldn't get POWER_SUPPLY_PROP_VOLTAGE_REGULATION, rc=%d\n",
+		dev_err(chg->dev, "Couldn't get POWER_SUPPLY_PROP_INPUT_VOLTAGE_REGULATION, rc=%d\n",
 				rc);
 		return rc;
 	}
@@ -4874,14 +4562,10 @@ int smblib_get_prop_dc_voltage_now(struct smb_charger *chg,
 int smblib_set_prop_dc_current_max(struct smb_charger *chg,
 				    const union power_supply_propval *val)
 {
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	int rc;
 
 	rc = vote(chg->dc_icl_votable, DCIN_ADAPTER_VOTER, true, val->intval);
 	return rc;
-#else
-	return smblib_set_charge_param(chg, &chg->param.dc_icl, val->intval);
-#endif
 }
 
 #define DCIN_AICL_RERUN_DELAY_MS	5000
@@ -4889,9 +4573,7 @@ int smblib_set_prop_voltage_wls_output(struct smb_charger *chg,
 				    const union power_supply_propval *val)
 {
 	int rc;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	union power_supply_propval pval = {0, };
-#endif
 
 	if (!chg->wls_psy) {
 		chg->wls_psy = power_supply_get_by_name("wireless");
@@ -4899,16 +4581,11 @@ int smblib_set_prop_voltage_wls_output(struct smb_charger *chg,
 			return -ENODEV;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	rc = power_supply_get_property(chg->wls_psy,
 				POWER_SUPPLY_PROP_TX_ADAPTER,
 				&pval);
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (pval.intval == 9 || pval.intval == 11 || pval.intval == 12 || pval.intval == 13 || pval.intval == 14) {
-#else
-	if (pval.intval == 9 || pval.intval == 11 || pval.intval == 12) {
-#endif
 		if (val->intval >= 9200000 && val->intval < 9500000)
 			vote(chg->dc_icl_votable, DCIN_LIMIT_VOTER, true, 2000000);
 		else if (val->intval > 9500000)
@@ -4926,7 +4603,6 @@ int smblib_set_prop_voltage_wls_output(struct smb_charger *chg,
 		smblib_dbg(chg, PR_WLS, "WLS chg type error %d\n", pval.intval);
 		return rc;
 	}
-#endif
 
 	rc = power_supply_set_property(chg->wls_psy,
 				POWER_SUPPLY_PROP_INPUT_VOLTAGE_REGULATION,
@@ -5003,23 +4679,6 @@ int smblib_set_prop_dc_reset(struct smb_charger *chg)
 	return rc;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_NABU
-void smblib_set_prop_pen_mac(struct smb_charger *chg,
-				const union power_supply_propval *val)
-{
-	smblib_dbg(chg, PR_WLS, "pen mac raw %llx\n", val->int64val);
-	chg->pen_bt_mac = val->int64val;
-	if (!chg->wls_psy) {
-		chg->wls_psy = power_supply_get_by_name("wireless");
-		if (!chg->wls_psy) {
-			smblib_err(chg, "no wireless power supply, return\n");
-			return;
-		}
-	}
-	power_supply_changed(chg->wls_psy);
-}
-#endif
-
 /*******************
  * USB PSY GETTERS *
  *******************/
@@ -5043,25 +4702,20 @@ int smblib_get_prop_usb_present(struct smb_charger *chg,
 int smblib_get_prop_usb_online(struct smb_charger *chg,
 			       union power_supply_propval *val)
 {
-	int rc = 0;
+	int usb_present, rc = 0;
 	u8 stat;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-	int usb_present;
 	union power_supply_propval pval = {0, };
-#endif
 
 	if (get_client_vote_locked(chg->usb_icl_votable, USER_VOTER) == 0) {
 		val->intval = false;
 		return rc;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (get_client_vote_locked(chg->usb_icl_votable, JEITA_VOTER) == 0) {
 		/* show online when JEITA_VOTER 0mA is vote to improve user experience */
 		val->intval = true;
 		return rc;
 	}
-#endif
 
 	if (is_client_vote_enabled_locked(chg->usb_icl_votable,
 					CHG_TERMINATION_VOTER)) {
@@ -5069,7 +4723,6 @@ int smblib_get_prop_usb_online(struct smb_charger *chg,
 		return rc;
 	}
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->use_bq_pump) {
 		rc = smblib_get_prop_usb_present(chg, &pval);
 		if (rc < 0) {
@@ -5086,35 +4739,6 @@ int smblib_get_prop_usb_online(struct smb_charger *chg,
 			return rc;
 		}
 	}
-#elif defined(CONFIG_MACH_XIAOMI_SM8150)
-	rc = smblib_get_prop_usb_present(chg, &pval);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't get usb present rc = %d\n", rc);
-		return rc;
-	}
-
-	usb_present = pval.intval;
-
-	if (usb_present && chg->typec_mode == POWER_SUPPLY_TYPEC_SINK_AUDIO_ADAPTER) {
-		val->intval = true;
-		return rc;
-	}
-
-	if (usb_present &&
-			get_client_vote_locked(chg->usb_icl_votable, JEITA_VOTER) == 0) {
-		val->intval = true;
-		return rc;
-	}
-
-	if (usb_present && chg->power_good_en) {
-		/* show online when insert usb in wireless charging */
-		if (chg->typec_mode == POWER_SUPPLY_TYPEC_SINK)
-			val->intval = false;
-		else
-			val->intval = true;
-		return rc;
-	}
-#endif
 
 	rc = smblib_read(chg, POWER_PATH_STATUS_REG, &stat);
 	if (rc < 0) {
@@ -5344,7 +4968,6 @@ int smblib_get_prop_vph_voltage_now(struct smb_charger *chg,
 	return 0;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 /*
  * we use usb in adc for distinguish qc_a and qc_b, so remain this func
  * for this purpose
@@ -5388,7 +5011,6 @@ int smblib_get_usb_in_voltage_now(struct smb_charger *chg,
 
 	return ret;
 }
-#endif
 
 bool smblib_rsbux_low(struct smb_charger *chg, int r_thr)
 {
@@ -5421,6 +5043,7 @@ bool smblib_rsbux_low(struct smb_charger *chg, int r_thr)
 		goto cleanup;
 	}
 
+	pr_info("r_sbu1 val is %d\n", r_sbu1);
 	if (r_sbu1 < r_thr) {
 		ret = true;
 		goto cleanup;
@@ -5439,6 +5062,7 @@ bool smblib_rsbux_low(struct smb_charger *chg, int r_thr)
 		goto cleanup;
 	}
 
+	pr_info("r_sbu2 val is %d\n", r_sbu2);
 	if (r_sbu2 < r_thr)
 		ret = true;
 cleanup:
@@ -5523,10 +5147,8 @@ static int smblib_get_prop_ufp_mode(struct smb_charger *chg)
 {
 	int rc;
 	u8 stat;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	union power_supply_propval val = {0, };
 	int usb_present = 0;
-#endif
 
 	rc = smblib_read(chg, TYPE_C_SNK_STATUS_REG, &stat);
 	if (rc < 0) {
@@ -5547,22 +5169,17 @@ static int smblib_get_prop_ufp_mode(struct smb_charger *chg)
 	case SNK_DAM_500MA_BIT:
 	case SNK_DAM_1500MA_BIT:
 	case SNK_DAM_3000MA_BIT:
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		return POWER_SUPPLY_TYPEC_SOURCE_DEFAULT;
-#else
-		return POWER_SUPPLY_TYPEC_SINK_DEBUG_ACCESSORY;
-#endif
 	default:
 		break;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	/* workaround for scp cable or similar A TO C cables */
 	rc = smblib_read(chg, TYPE_C_SNK_DEBUG_ACC_STATUS_REG, &stat);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't read TYPE_C_STATUS_1 rc=%d\n", rc);
-		return POWER_SUPPLY_TYPEC_NONE; // git
-	} // git
+		return POWER_SUPPLY_TYPEC_NONE;
+	}
 
 	rc = smblib_get_prop_usb_present(chg, &val);
 	if (rc < 0)
@@ -5577,7 +5194,6 @@ static int smblib_get_prop_ufp_mode(struct smb_charger *chg)
 		chg->snk_debug_acc_detected = true;
 		return POWER_SUPPLY_TYPEC_SOURCE_DEFAULT;
 	}
-#endif
 	return POWER_SUPPLY_TYPEC_NONE;
 }
 
@@ -5595,9 +5211,6 @@ static int smblib_get_prop_dfp_mode(struct smb_charger *chg)
 				rc);
 		return POWER_SUPPLY_TYPEC_NONE;
 	}
-#if !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-	smblib_dbg(chg, PR_REGISTER, "TYPE_C_SRC_STATUS_REG = 0x%02x\n", stat);
-#endif
 
 	switch (stat & DETECTED_SNK_TYPE_MASK) {
 	case AUDIO_ACCESS_RA_RA_BIT:
@@ -5646,7 +5259,7 @@ int smblib_get_prop_typec_power_role(struct smb_charger *chg,
 			rc);
 		return rc;
 	}
-	smblib_dbg(chg, PR_REGISTER, "TYPE_C_MODE_CFG_REG = 0x%02x\n",
+	smblib_dbg(chg, PR_MISC, "TYPE_C_MODE_CFG_REG = 0x%02x\n",
 		   ctrl);
 
 	if (ctrl & TYPEC_DISABLE_CMD_BIT) {
@@ -5979,9 +5592,7 @@ static int smblib_get_typec_connector_temp_status(struct smb_charger *chg)
 	return POWER_SUPPLY_HEALTH_COOL;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 #define HVDCP_START_CURRENT_UA		1000000
-#endif
 
 int smblib_get_skin_temp_status(struct smb_charger *chg)
 {
@@ -6036,7 +5647,7 @@ int smblib_get_prop_connector_health(struct smb_charger *chg)
 	return POWER_SUPPLY_HEALTH_COOL;
 }
 
-#if !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
+#if 0
 static int get_rp_based_dcp_current(struct smb_charger *chg, int typec_mode)
 {
 	int rp_ua;
@@ -6077,40 +5688,28 @@ int smblib_set_prop_pd_current_max(struct smb_charger *chg,
 	return rc;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 #define FLOAT_CHARGER_UA		1000000
 #define SUSPEND_CURRENT_UA		2000
-#endif
 static int smblib_handle_usb_current(struct smb_charger *chg,
 					int usb_current)
 {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	int rc = 0, typec_mode;
-#else
-	int rc = 0, rp_ua, typec_mode;
-#endif
 	union power_supply_propval val = {0, };
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	bool is_float = false;
-#endif
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_FLOAT
-				&& (usb_current == SUSPEND_CURRENT_UA))
+			&& (usb_current == SUSPEND_CURRENT_UA))
 		is_float = true;
 
 	if ((usb_current > 0 && usb_current < USBIN_500MA)
 			|| (usb_current == USBIN_900MA))
 		usb_current = USBIN_500MA;
-#endif
 
 	if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_FLOAT) {
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-		if (usb_current == -ETIMEDOUT || is_float) {
-#else
-		if (usb_current == -ETIMEDOUT) {
-#endif
-#ifndef CONFIG_MACH_XIAOMI_SM8150
+		if (usb_current == -ETIMEDOUT
+				|| is_float) {
+			/* we do not use USB500mA for float charger */
+#if 0
 			if ((chg->float_cfg & FLOAT_OPTIONS_MASK)
 						== FORCE_FLOAT_SDP_CFG_BIT) {
 				/*
@@ -6126,7 +5725,6 @@ static int smblib_handle_usb_current(struct smb_charger *chg,
 				return rc;
 			}
 #endif
-
 			if (chg->connector_type ==
 					POWER_SUPPLY_CONNECTOR_TYPEC) {
 				/*
@@ -6134,20 +5732,8 @@ static int smblib_handle_usb_current(struct smb_charger *chg,
 				 * based of Rp.
 				 */
 				typec_mode = smblib_get_prop_typec_mode(chg);
-#if !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-				rp_ua = get_rp_based_dcp_current(chg,
-								typec_mode);
-#endif
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-				if (rp_ua == DCP_CURRENT_UA)
-					rp_ua = FLOAT_CHARGER_UA;
-#endif
 				rc = vote(chg->usb_icl_votable,
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 						SW_ICL_MAX_VOTER, true, FLOAT_CHARGER_UA);
-#else
-						SW_ICL_MAX_VOTER, true, rp_ua);
-#endif
 				if (rc < 0)
 					return rc;
 			} else {
@@ -6163,9 +5749,7 @@ static int smblib_handle_usb_current(struct smb_charger *chg,
 			 * real_charger_type
 			 */
 			chg->real_charger_type = POWER_SUPPLY_TYPE_USB;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 			chg->usb_psy_desc.type = POWER_SUPPLY_TYPE_USB;
-#endif
 			rc = vote(chg->usb_icl_votable, USB_PSY_VOTER,
 						true, usb_current);
 			if (rc < 0)
@@ -6180,17 +5764,12 @@ static int smblib_handle_usb_current(struct smb_charger *chg,
 		if (!rc && !val.intval)
 			return 0;
 
-		if (chg->dcin_uusb_over_gpio_en &&
-			gpio_is_valid(chg->dc_9v_gpio) &&
-			gpio_get_value(chg->dc_9v_gpio))
-			usb_current = DCP_CURRENT_UA;
-
 		/* if flash is active force 500mA */
 		if ((usb_current < SDP_CURRENT_UA) && is_flash_active(chg))
 			usb_current = SDP_CURRENT_UA;
 
 		rc = vote(chg->usb_icl_votable, USB_PSY_VOTER, true,
-					usb_current);
+							usb_current);
 		if (rc < 0) {
 			pr_err("Couldn't vote ICL USB_PSY_VOTER rc=%d\n", rc);
 			return rc;
@@ -6201,6 +5780,7 @@ static int smblib_handle_usb_current(struct smb_charger *chg,
 			pr_err("Couldn't remove SW_ICL_MAX vote rc=%d\n", rc);
 			return rc;
 		}
+
 	}
 
 	return 0;
@@ -6221,11 +5801,7 @@ int smblib_set_prop_sdp_current_max(struct smb_charger *chg,
 		}
 
 		/* handle the request only when USB is present */
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		if (pval.intval && (val->intval != 0))
-#else
-		if (pval.intval)
-#endif
 			rc = smblib_handle_usb_current(chg, val->intval);
 	} else if (chg->system_suspend_supported) {
 		if (val->intval <= USBIN_25MA)
@@ -6238,7 +5814,6 @@ int smblib_set_prop_sdp_current_max(struct smb_charger *chg,
 	return rc;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 int smblib_get_prop_type_recheck(struct smb_charger *chg,
 				    union power_supply_propval *val)
 {
@@ -6264,7 +5839,6 @@ int smblib_set_prop_type_recheck(struct smb_charger *chg,
 	}
 	return 0;
 }
-#endif
 
 int smblib_set_prop_boost_current(struct smb_charger *chg,
 					const union power_supply_propval *val)
@@ -6410,6 +5984,8 @@ int smblib_set_prop_typec_power_role(struct smb_charger *chg,
 		return -EINVAL;
 	}
 
+	smblib_dbg(chg, PR_MISC, "set power_role to 0x%x\n", power_role);
+
 	rc = smblib_masked_write(chg, TYPE_C_MODE_CFG_REG,
 				TYPEC_POWER_ROLE_CMD_MASK | TYPEC_TRY_MODE_MASK,
 				power_role);
@@ -6511,7 +6087,6 @@ int smblib_set_prop_pd_active(struct smb_charger *chg,
 
 	smblib_apsd_enable(chg, !chg->pd_active);
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (!chg->pd && chg->use_bq_pump) {
 		chg->pd = devm_usbpd_get_by_phandle(chg->dev,
 				"qcom,usbpd-phandle");
@@ -6519,7 +6094,6 @@ int smblib_set_prop_pd_active(struct smb_charger *chg,
 			pr_err("Failed to get pd handle %ld\n",
 					PTR_ERR(chg->pd));
 	}
-#endif
 
 	update_sw_icl_max(chg, apsd->pst);
 
@@ -6538,18 +6112,12 @@ int smblib_set_prop_pd_active(struct smb_charger *chg,
 		vote(chg->usb_icl_votable, USB_PSY_VOTER, false, 0);
 		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, false, 0);
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		/*set the icl to PD_UNVERIFED_CURRENT when pd is not verifed*/
 		if (!chg->pd_verifed) {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 			rc = vote(chg->fcc_votable, PD_VERIFED_VOTER, true, PD_UNVERIFED_CURRENT);
-#else
-			rc = vote(chg->usb_icl_votable, PD_VERIFED_VOTER, true, PD_UNVERIFED_CURRENT);
-#endif
 			if (rc < 0)
 				smblib_err(chg, "Couldn't unvote PD_VERIFED_VOTER, rc=%d\n", rc);
 		}
-#endif
 
 		/*
 		 * For PPS, Charge Pump is preferred over parallel charger if
@@ -6563,12 +6131,10 @@ int smblib_set_prop_pd_active(struct smb_charger *chg,
 			if (rc < 0)
 				dev_err(chg->dev, "Couldn't enable secondary charger rc=%d\n",
 					rc);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 			else
 				chg->cp_reason = POWER_SUPPLY_CP_PPS;
-#endif
 		}
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
+
 		if (chg->pd_active == POWER_SUPPLY_PD_PPS_ACTIVE
 						&& chg->six_pin_step_charge_enable) {
 			/* start six pin battery step charge monitor work */
@@ -6576,6 +6142,7 @@ int smblib_set_prop_pd_active(struct smb_charger *chg,
 					msecs_to_jiffies(STEP_CHG_DELAYED_START_MS));
 		}
 
+#ifdef CONFIG_THERMAL
 		smblib_therm_charging(chg);
 #endif
 	} else {
@@ -6604,18 +6171,7 @@ int smblib_set_prop_pd_active(struct smb_charger *chg,
 
 	smblib_usb_pd_adapter_allowance_override(chg,
 			!!chg->pd_active ? FORCE_5V : FORCE_NULL);
-
-#if !(defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)))
 	smblib_update_usb_type(chg);
-#else
-	if (!chg->fake_usb_insertion)
-		smblib_update_usb_type(chg);
-#endif
-
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-	smblib_therm_charging(chg);
-#endif
-
 	power_supply_changed(chg->usb_psy);
 	return rc;
 }
@@ -6707,10 +6263,8 @@ static int smblib_soft_jeita_arb_wa(struct smb_charger *chg)
 	int rc = 0;
 	bool soft_jeita;
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	/* we still use old soft jeita method */
 	return 0;
-#endif
 
 	rc = smblib_get_prop_batt_health(chg, &pval);
 	if (rc < 0) {
@@ -6852,33 +6406,17 @@ int smblib_get_charge_current(struct smb_charger *chg,
 
 	typec_source_rd = smblib_get_prop_ufp_mode(chg);
 
-#ifdef CONFIG_MACH_XIAOMI_NABU
-	/* QC 3.5 adapter */
-	if (chg->qc3p5_supported &&
-			(apsd_result->pst == POWER_SUPPLY_TYPE_USB_HVDCP_3P5) &&
-			(chg->qc3p5_power_limit_w == 40)) {
-		*total_current_ua = HVDCP3P5_40W_CURRENT_UA;
-		return 0;
-	}
-#endif
-
-	/* QC 2.0/3.0 adapter */
-#ifdef CONFIG_MACH_XIAOMI_SM8150
+	/* QC 3.0 adapter */
 	if (apsd_result->bit & QC_3P0_BIT) {
-#else
-	if (apsd_result->bit & (QC_3P0_BIT | QC_2P0_BIT)) {
-#endif
 		*total_current_ua = HVDCP_CURRENT_UA;
 		return 0;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	/* QC 2.0 adapter */
 	if (apsd_result->bit & QC_2P0_BIT) {
 		*total_current_ua = HVDCP2_CURRENT_UA;
 		return 0;
 	}
-#endif
 
 	if (non_compliant && !chg->typec_legacy_use_rp_icl) {
 		switch (apsd_result->bit) {
@@ -7060,7 +6598,6 @@ static void smblib_eval_chg_termination(struct smb_charger *chg, u8 batt_status)
 	}
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 irqreturn_t dcin_uv_handler(int irq, void *data)
 {
 	struct smb_irq_data *irq_data = data;
@@ -7087,7 +6624,6 @@ irqreturn_t dcin_uv_handler(int irq, void *data)
 
 	return IRQ_HANDLED;
 }
-#endif
 
 irqreturn_t chg_state_change_irq_handler(int irq, void *data)
 {
@@ -7120,8 +6656,7 @@ irqreturn_t batt_temp_changed_irq_handler(int irq, void *data)
 	struct smb_charger *chg = irq_data->parent_data;
 	int rc;
 
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
-
+	smblib_dbg(chg, PR_OEM, "IRQ: %s\n", irq_data->name);
 	if (chg->jeita_configured != JEITA_CFG_COMPLETE)
 		return IRQ_HANDLED;
 
@@ -7132,11 +6667,9 @@ irqreturn_t batt_temp_changed_irq_handler(int irq, void *data)
 		return IRQ_HANDLED;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	/* we still use old soft jeita method */
 	rerun_election(chg->fcc_votable);
 	power_supply_changed(chg->batt_psy);
-#endif
 
 	return IRQ_HANDLED;
 }
@@ -7227,6 +6760,8 @@ unsuspend_input:
 		reset_storm_count(wdata);
 	}
 
+	smblib_dbg(chg, PR_OEM, "IRQ: %s\n", irq_data->name);
+
 	if (!chg->irq_info[SWITCHER_POWER_OK_IRQ].irq_data)
 		return IRQ_HANDLED;
 
@@ -7235,9 +6770,7 @@ unsuspend_input:
 
 	/* Workaround for non-QC2.0-compliant chargers follows */
 	if (!chg->qc2_unsupported_voltage &&
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 			!chg->qc2_unsupported &&
-#endif
 			apsd->pst == POWER_SUPPLY_TYPE_USB_HVDCP) {
 		rc = smblib_read(chg, QC_CHANGE_STATUS_REG, &stat);
 		if (rc < 0)
@@ -7284,7 +6817,6 @@ unsuspend_input:
 
 		smblib_rerun_apsd(chg);
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		pr_info("qc2_unsupported charger detected\n");
 		rc = smblib_force_vbus_voltage(chg, FORCE_5V_BIT);
 		if (rc < 0)
@@ -7298,7 +6830,6 @@ unsuspend_input:
 		vote(chg->usb_icl_votable, QC2_UNSUPPORTED_VOTER, true,
 				QC2_UNSUPPORTED_UA);
 		chg->qc2_unsupported = true;
-#endif
 	}
 
 	return IRQ_HANDLED;
@@ -7358,7 +6889,6 @@ irqreturn_t icl_change_irq_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 static void smblib_cc_un_compliant_charge_work(struct work_struct *work)
 {
 	union power_supply_propval val = {0, };
@@ -7409,8 +6939,6 @@ static void smblib_cc_un_compliant_charge_work(struct work_struct *work)
 		smblib_rerun_apsd_if_required(chg);
 	}
 }
-
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static void smb_check_init_boot(struct work_struct *work)
 {
 	struct smb_charger *chg = container_of(work, struct smb_charger,
@@ -7419,56 +6947,6 @@ static void smb_check_init_boot(struct work_struct *work)
 	if (chg->usb_psy)
 		power_supply_changed(chg->usb_psy);
 }
-
-#ifdef CONFIG_CHARGER_LN8000
-static int fv_over_limit_times;
-#define OVER_FV_MAX_TIMES	10
-static void smblib_check_vbat_work(struct work_struct *work)
-{
-	int rc;
-	int effective_fv_uv;
-	union power_supply_propval val;
-
-	struct smb_charger *chg = container_of(work, struct smb_charger,
-			check_vbat_work.work);
-	if (!chg->cp_psy) {
-		chg->cp_psy = power_supply_get_by_name("bq2597x-standalone");
-		if (!chg->cp_psy){
-			chg->cp_psy = power_supply_get_by_name("ln8000");
-			if (!chg->cp_psy){
-				pr_err("cp_psy not found\n");
-				return;
-			}
-		}
-	}
-
-	rc = power_supply_get_property(chg->cp_psy,
-				POWER_SUPPLY_PROP_MODEL_NAME, &val);
-	if (rc < 0) {
-		pr_err("Error in getting charge IC name, rc=%d\n", rc);
-		return;
-	}
-
-	if (strcmp(val.strval, "bq2597x-standalone") == 0) {
-		rc = power_supply_get_property(chg->cp_psy,
-				POWER_SUPPLY_PROP_TI_BATTERY_VOLTAGE, &val);
-		pr_err("getting ti battery voltage = %d\n", val.intval);
-		if (rc < 0) {
-			pr_err("Error in getting ti battery voltage, rc=%d\n", rc);
-			return;
-		}
-		if (val.intval > 4800) {
-			if (fv_over_limit_times++  > OVER_FV_MAX_TIMES) {
-				fv_over_limit_times = 0;
-				effective_fv_uv = get_effective_result_locked(chg->fv_votable);
-				vote(chg->fv_votable, BATT_BQ2597X_VOTER, true, effective_fv_uv - 10000);
-			}
-		}
-	}
-	schedule_delayed_work(&chg->check_vbat_work, msecs_to_jiffies(200));
-
-}
-#endif
 
 #define REDUCED_CURRENT		500000
 static int smblib_get_effective_fcc_val(struct smb_charger *chg)
@@ -7487,17 +6965,9 @@ static int check_reduce_fcc_condition(struct smb_charger *chg)
 
 	if (!chg->cp_psy) {
 		chg->cp_psy = power_supply_get_by_name("bq2597x-standalone");
-	}
-
-#ifdef CONFIG_CHARGER_LN8000
-	if (!chg->cp_psy){
-		chg->cp_psy = power_supply_get_by_name("ln8000");
-	}
-#endif
-
-	if (!chg->cp_psy) {
-		pr_err("cp_psy not found\n");
-		return 0;
+		if (!chg->cp_psy)
+			pr_err("cp_psy not found\n");
+			return 0;
 	}
 
 	rc = power_supply_get_property(chg->cp_psy,
@@ -7592,8 +7062,6 @@ static void reduce_fcc_work(struct work_struct *work)
 	schedule_delayed_work(&chg->reduce_fcc_work,
 				msecs_to_jiffies(esr_work_time));
 }
-#endif
-#endif
 
 static void smblib_micro_usb_plugin(struct smb_charger *chg, bool vbus_rising)
 {
@@ -7604,9 +7072,7 @@ static void smblib_micro_usb_plugin(struct smb_charger *chg, bool vbus_rising)
 	}
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static void typec_src_removal(struct smb_charger *chg);
-#endif
 void smblib_usb_plugin_hard_reset_locked(struct smb_charger *chg)
 {
 	int rc;
@@ -7624,17 +7090,13 @@ void smblib_usb_plugin_hard_reset_locked(struct smb_charger *chg)
 	vbus_rising = (bool)(stat & USBIN_PLUGIN_RT_STS_BIT);
 
 	if (vbus_rising) {
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		/* hold chg_awake wakeup source when charger is present */
 		vote(chg->awake_votable, CHG_AWAKE_VOTER, true, 0);
-#endif
 		/* Remove FCC_STEPPER 1.5A init vote to allow FCC ramp up */
 		if (chg->fcc_stepper_enable)
 			vote(chg->fcc_votable, FCC_STEPPER_VOTER, false, 0);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->six_pin_step_charge_enable)
 			smblib_get_start_vbat_before_step_charge(chg);
-#endif
 	} else {
 		if (chg->wa_flags & BOOST_BACK_WA) {
 			data = chg->irq_info[SWITCHER_POWER_OK_IRQ].irq_data;
@@ -7649,27 +7111,19 @@ void smblib_usb_plugin_hard_reset_locked(struct smb_charger *chg)
 			}
 		}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		cancel_delayed_work_sync(&chg->charger_type_recheck);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		chg->hvdcp_recheck_status = false;
-#endif
 		chg->recheck_charger = false;
 		chg->precheck_charger_type = POWER_SUPPLY_TYPE_UNKNOWN;
 		if (chg->cc_un_compliant_detected) {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 			/* disable apsd if cc_un_compliant detected after plug out */
 			//smblib_apsd_enable(chg, false);
 			typec_src_removal(chg);
-#else
-			smblib_hvdcp_detect_enable(chg, false);
-#endif
 			chg->cc_un_compliant_detected = false;
 		}
 
 		/* clear chg_awake wakeup source when charger is absent */
 		vote(chg->awake_votable, CHG_AWAKE_VOTER, false, 0);
-#endif
 
 		/* Force 1500mA FCC on USB removal if fcc stepper is enabled */
 		if (chg->fcc_stepper_enable)
@@ -7678,7 +7132,7 @@ void smblib_usb_plugin_hard_reset_locked(struct smb_charger *chg)
 	}
 
 	power_supply_changed(chg->usb_psy);
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: usbin-plugin %s\n",
+	smblib_dbg(chg, PR_OEM, "IRQ: usbin-plugin %s\n",
 					vbus_rising ? "attached" : "detached");
 }
 
@@ -7702,14 +7156,11 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 						chg->chg_freq.freq_removal);
 
 	if (vbus_rising) {
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		/* when vbus present, enable batt_temp irq wakeup */
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->irq_info[BAT_TEMP_IRQ].irq && !chg->batt_temp_irq_enabled) {
 			enable_irq_wake(chg->irq_info[BAT_TEMP_IRQ].irq);
 			chg->batt_temp_irq_enabled = true;
 		}
-#endif
 		if (smblib_get_prop_dfp_mode(chg) != POWER_SUPPLY_TYPEC_NONE
 				&& smblib_get_prop_dfp_mode(chg)
 					!= POWER_SUPPLY_TYPEC_SINK_AUDIO_ADAPTER) {
@@ -7719,14 +7170,13 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 
 		/* hold a wakeup source when charger is present */
 		vote(chg->awake_votable, CHG_AWAKE_VOTER, true, 0);
-#endif
 		cancel_delayed_work_sync(&chg->pr_swap_detach_work);
 		vote(chg->awake_votable, DETACH_DETECT_VOTER, false, 0);
 		rc = smblib_request_dpdm(chg, true);
 		if (rc < 0)
 			smblib_err(chg, "Couldn't to enable DPDM rc=%d\n", rc);
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
+#ifdef CONFIG_BATT_VERIFY_BY_DS28E16
 		smblib_check_batt_authentic(chg);
 #endif
 
@@ -7740,56 +7190,38 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 		if (chg->fcc_stepper_enable)
 			vote(chg->fcc_votable, FCC_STEPPER_VOTER, false, 0);
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->six_pin_step_charge_enable)
 			smblib_get_start_vbat_before_step_charge(chg);
-#endif
 
 		/* Schedule work to enable parallel charger */
 		vote(chg->awake_votable, PL_DELAY_VOTER, true, 0);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (!first_boot_flag)
 			schedule_delayed_work(&chg->check_init_boot, msecs_to_jiffies(18000));
-#endif
 		schedule_delayed_work(&chg->pl_enable_work,
 					msecs_to_jiffies(PL_DELAY_MS));
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		schedule_delayed_work(&chg->charger_type_recheck,
 					msecs_to_jiffies(CHARGER_RECHECK_DELAY_MS));
 		schedule_delayed_work(&chg->cc_un_compliant_charge_work,
 					msecs_to_jiffies(CC_UN_COMPLIANT_START_DELAY_MS));
-#ifdef CONFIG_CHARGER_LN8000
-		schedule_delayed_work(&chg->check_vbat_work, msecs_to_jiffies(200));
-#endif
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->use_bq_pump)
 			schedule_delayed_work(&chg->reduce_fcc_work,
 						msecs_to_jiffies(ESR_WORK_TIME_180S));
-#endif
-#endif
 	} else {
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		/* when vbus absent, disable batt_temp irq wakeup */
 		if (chg->irq_info[BAT_TEMP_IRQ].irq && chg->batt_temp_irq_enabled) {
 			disable_irq_wake(chg->irq_info[BAT_TEMP_IRQ].irq);
 			chg->batt_temp_irq_enabled = false;
 		}
-#endif
-
 		if (chg->fake_usb_insertion) {
 			chg->fake_usb_insertion = false;
 			return;
 		}
 
 		cancel_delayed_work_sync(&chg->charger_type_recheck);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->use_bq_pump) {
 			cancel_delayed_work_sync(&chg->reduce_fcc_work);
 			vote(chg->fcc_votable, ESR_WORK_VOTER, false, 0);
 		}
-#endif
-#endif
 
 		/* Disable SW Thermal Regulation */
 		rc = smblib_set_sw_thermal_regulation(chg, false);
@@ -7846,26 +7278,18 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 		if (rc < 0)
 			smblib_err(chg, "Couldn't disable DPDM rc=%d\n", rc);
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		if (chg->cc_un_compliant_detected) {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 			/* disable apsd if cc_un_compliant detected after plug out */
 			//smblib_apsd_enable(chg, false);
 			typec_src_removal(chg);
-#else
-			smblib_hvdcp_detect_enable(chg, false);
-#endif
 			chg->cc_un_compliant_detected = false;
 		}
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		chg->hvdcp_recheck_status = false;
-#endif
 		chg->recheck_charger = false;
 		chg->precheck_charger_type = POWER_SUPPLY_TYPE_UNKNOWN;
 		/* clear chg_awake wakeup source when charger is absent */
 		vote(chg->awake_votable, CHG_AWAKE_VOTER, false, 0);
-#endif
 		smblib_update_usb_type(chg);
 	}
 
@@ -7876,9 +7300,10 @@ void smblib_usb_plugin_locked(struct smb_charger *chg)
 						!vbus_rising, 0);
 
 	power_supply_changed(chg->usb_psy);
+
 	if (chg->dual_role)
 		dual_role_instance_changed(chg->dual_role);
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: usbin-plugin %s\n",
+	smblib_dbg(chg, PR_OEM, "IRQ: usbin-plugin %s\n",
 					vbus_rising ? "attached" : "detached");
 }
 
@@ -7909,171 +7334,7 @@ static void smblib_handle_sdp_enumeration_done(struct smb_charger *chg,
 		   rising ? "rising" : "falling");
 }
 
-#ifdef CONFIG_MACH_XIAOMI_NABU
-static bool qc3p5_vbus_timeout_check(struct smb_charger *chg,
-		int timeout_ms, int vbus_lo_bound,
-		int vbus_hi_bound, int *vbus_uv)
-{
-		union power_supply_propval pval;
-		ktime_t start_kt, delta_kt;
-		int rc = 0;
-
-		rc = power_supply_get_property(chg->usb_psy,
-				POWER_SUPPLY_PROP_VOLTAGE_NOW, &pval);
-		if (rc < 0) {
-			smblib_err(chg, "Couldn't get VBUS voltage rc=%d\n", rc);
-			return false;
-		}
-
-		start_kt = ktime_get_boottime();
-		delta_kt = ktime_sub(ktime_get_boottime(), start_kt);
-		while (((pval.intval <= vbus_lo_bound) || (pval.intval >= vbus_hi_bound))
-				&& (ktime_to_ms(delta_kt) < timeout_ms)) {
-			rc = power_supply_get_property(chg->usb_psy,
-					POWER_SUPPLY_PROP_VOLTAGE_NOW, &pval);
-			if (rc < 0) {
-				smblib_err(chg, "Couldn't get VBUS voltage rc=%d\n", rc);
-				return false;
-			}
-			delta_kt = ktime_sub(ktime_get_boottime(), start_kt);
-		}
-
-		if ((pval.intval <= vbus_lo_bound)
-				|| (pval.intval >= vbus_hi_bound)
-				|| (ktime_to_ms(delta_kt) > timeout_ms)) {
-			smblib_err(chg, "QC3.5: VBUS failed to settle\n");
-			return false;
-		}
-
-		*vbus_uv = (int)pval.intval;
-		smblib_err(chg, "QC3.5: VBUS successfully settled\n");
-
-		return true;
-}
-
-#define	QC3P5_T_TA_DETECTION_TIMEOUT_PMIC_MS	200
-#define	QC3P5_T_TA_CAP_TIMEOUT_PMIC_MS			250
-#define	VBUS_5P5_V_UV							5500000
-#define	VBUS_6P4_V_UV							6400000
-#define	VBUS_6P65_V_UV							6650000
-#define	VBUS_7P35_V_UV							7350000
-#define	VBUS_7P6_V_UV							7600000
-#define	VBUS_8P4_V_UV							8400000
-/*Use 8.55V and 9.8V to account for +10% and -5% spec on 9V for QC2/3 */
-#define	VBUS_8P55_V_UV							8550000
-#define	VBUS_9P8_V_UV							9800000
-
-static int qc3p5_authenticate(struct smb_charger *chg)
-{
-	int i, vbus_uv, rc = 0;
-
-	chg->qc3p5_authenticated = false;
-	chg->qc3p5_authentication_started = true;
-	chg->qc3p5_power_limit_w = 18;//Default to lowest power limit of 18W
-
-	/* Set ICL to 500mA during QC3.5 Authentication */
-	vote(chg->usb_icl_votable, QC3P5_VOTER, true, USBIN_500MA);
-
-	/*
-	 *	 * Fall back to QC3.0 Mode if VBUS doesn't settle between
-	 *		 * 5.5V and 6.4V in 200ms
-	 *			 */
-	if (!qc3p5_vbus_timeout_check(chg, QC3P5_T_TA_DETECTION_TIMEOUT_PMIC_MS,
-				VBUS_5P5_V_UV, VBUS_6P4_V_UV, &vbus_uv)) {
-		smblib_err(chg, "VBUS doesn't reach 6V vbus=%d\n", vbus_uv);
-		return -ENODEV;
-	}
-
-	smblib_err(chg, "QC3P5 AUTH: After QC3.0 Auth VBUS = %d\n", vbus_uv);
-
-	/* Issue +-+-+- to request SRC CAP */
-	for (i = 0; i < 3; i++) {
-		rc = smblib_dp_pulse(chg);
-		if (rc < 0) {
-			smblib_err(chg, "Couldn't issue D+ pulse rc=%d\n", rc);
-			return rc;
-		}
-		usleep_range(5000, 5010);
-
-		rc = smblib_dm_pulse(chg);
-		if (rc < 0) {
-			smblib_err(chg, "Couldn't issue D- pulse rc=%d\n", rc);
-			return rc;
-		}
-		usleep_range(5000, 5010);
-	}
-
-	/* Return to QC3.0 Mode if VBUS doesn't reach 7V in 200ms 50ms buffer */
-	if (!qc3p5_vbus_timeout_check(chg, QC3P5_T_TA_CAP_TIMEOUT_PMIC_MS,
-				VBUS_6P65_V_UV, VBUS_9P8_V_UV, &vbus_uv)) {
-		smblib_err(chg, "VBUS doesn't reach 7V vbus=%d\n", vbus_uv);
-		return -ENODEV;
-	}
-	smblib_err(chg, "QC3P5 AUTH: SRC_CAP receieved\n");
-
-	/* Issue ++-- to confirm transition to QC3.5 */
-	rc = smblib_dp_pulse(chg);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't issue D+ pulse rc=%d\n", rc);
-		return rc;
-	}
-	usleep_range(5000, 5010);
-
-	rc = smblib_dp_pulse(chg);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't issue D+ pulse rc=%d\n", rc);
-		return rc;
-	}
-	usleep_range(5000, 5010);
-
-	rc = smblib_dm_pulse(chg);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't issue D- pulse rc=%d\n", rc);
-		return rc;
-	}
-	usleep_range(5000, 5010);
-
-	rc = smblib_dm_pulse(chg);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't issue D- pulse rc=%d\n", rc);
-		return rc;
-	}
-
-	/* SRC CAP 7V for 18W */
-	if ((vbus_uv >= VBUS_6P65_V_UV) && (vbus_uv <= VBUS_7P35_V_UV)) {
-		chg->qc3p5_power_limit_w = 18;
-		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, QC3P5_CHARGER_ICL);
-	/* SRC CAP 8V for 27W */
-	} else if ((vbus_uv >= VBUS_7P6_V_UV) && (vbus_uv <= VBUS_8P4_V_UV)) {
-		chg->qc3p5_power_limit_w = 27;
-		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, QC3P5_CHARGER_ICL);
-	/* SRC CAP 9V for 40W */
-	} else if ((vbus_uv >= VBUS_8P55_V_UV) && (vbus_uv <= VBUS_9P8_V_UV)) {
-		chg->qc3p5_power_limit_w = 40;
-		// QC3.5 40W adapter's icl limited to 4A
-		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, HVDCP3P5_40W_CURRENT_UA);
-	} else {
-		smblib_err(chg, "not supported SRC CAP, vbus=%d\n", vbus_uv);
-		return -ENODEV;
-	}
-
-	chg->qc3p5_authenticated = true;
-	vote(chg->fcc_votable, FCC_MAX_QC3P5_VOTER, true, HVDCP3P5_40W_CURRENT_UA);
-
-	if (chg->support_ffc && !smblib_get_fastcharge_mode(chg))
-	smblib_set_fastcharge_mode(chg, true);
-
-	smblib_err(chg, "QC3P5 AUTH: QC3.5 Authenticated\n");
-	smblib_err(chg, "QC3P5 AUTH: Power Limit = %d\n",
-			chg->qc3p5_power_limit_w);
-
-	return rc;
-}
-#endif
-
 #define APSD_EXTENDED_TIMEOUT_MS	400
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static int smblib_hvdcp3_raise_fsw(struct smb_charger *chg, int pulse_count)
 {
 	if (pulse_count < QC3_PULSES_FOR_6V)
@@ -8090,7 +7351,6 @@ static int smblib_hvdcp3_raise_fsw(struct smb_charger *chg, int pulse_count)
 				chg->chg_freq.freq_12V);
 	return 0;
 }
-#endif
 
 static void smblib_raise_qc3_vbus_work(struct work_struct *work)
 {
@@ -8109,7 +7369,6 @@ static void smblib_raise_qc3_vbus_work(struct work_struct *work)
 
 	usb_present = val.intval;
 	if (usb_present) {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->pd_hard_reset) {
 			if (chg->detect_low_power_qc3_charger)
 				chg->detect_low_power_qc3_charger = false;
@@ -8118,25 +7377,14 @@ static void smblib_raise_qc3_vbus_work(struct work_struct *work)
 			pr_info("pd hard reset, no need to raise vbus now\n");
 			return;
 		}
-#endif
 
 		chg->raise_vbus_to_detect = true;
 		for (i = 0; i < MAX_PULSE; i++) {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 			smblib_hvdcp3_raise_fsw(chg, i);
-#endif
 			rc = smblib_dp_pulse(chg);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
-			msleep(40);
-#else
 			msleep(30);
-#endif
 		}
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
-		msleep(200);
-#else
 		msleep(100);
-#endif
 		rc = smblib_get_prop_usb_present(chg, &val);
 		if (rc < 0) {
 			smblib_err(chg, "Couldn't get usb present rc = %d\n", rc);
@@ -8165,12 +7413,8 @@ static void smblib_raise_qc3_vbus_work(struct work_struct *work)
 		else
 			vol_qc_ab_thr = VOL_THR_FOR_QC_CLASS_AB;
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (vbus_now <= vol_qc_ab_thr
 				|| chg->batt_profile_fcc_ua <= QC_CLASS_A_CURRENT_UA) {
-#else
-		if (vbus_now <= vol_qc_ab_thr) {	
-#endif
 			pr_info("qc_class_a charger is detected, batt_profile_fcc=%d\n", chg->batt_profile_fcc_ua);
 			chg->is_qc_class_a = true;
 			vote(chg->fcc_votable,
@@ -8185,44 +7429,33 @@ static void smblib_raise_qc3_vbus_work(struct work_struct *work)
 		if (rc < 0)
 			pr_err("Failed to force 5V\n");
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		msleep(100);
 
 		rc = smblib_dp_pulse(chg);
-#endif
 
 		if (chg->is_qc_class_a) {
 			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 					HVDCP_CLASS_A_MAX_UA);
 		} else {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 				HVDCP_CLASS_B_CURRENT_UA);
 			if (chg->support_ffc) {
 				if (!smblib_get_fastcharge_mode(chg))
 					smblib_set_fastcharge_mode(chg, true);
 			}
-#else
-			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
-				HVDCP_CURRENT_UA);
-#endif
 		}
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->use_bq_pump)
 		vote(chg->usb_icl_votable, HVDCP3_START_ICL_VOTER, false, 0);
 
 	if (!chg->use_bq_pump) {
-#endif
 		/* select charge pump as second charger */
 		rc = smblib_select_sec_charger(chg, POWER_SUPPLY_CHARGER_SEC_CP,
 						POWER_SUPPLY_CP_HVDCP3, false);
 		if (rc < 0)
 			dev_err(chg->dev,
 				"Couldn't enable secondary chargers  rc=%d\n", rc);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	}
-#endif
 
 #ifdef CONFIG_THERMAL
 		if (chg->cp_reason == POWER_SUPPLY_CP_HVDCP3)
@@ -8232,7 +7465,7 @@ static void smblib_raise_qc3_vbus_work(struct work_struct *work)
 	}
 }
 
-struct quick_charge adapter_cap[] = {
+struct quick_charge adapter_cap[11] = {
 	{ POWER_SUPPLY_TYPE_USB,        QUICK_CHARGE_NORMAL },
 	{ POWER_SUPPLY_TYPE_USB_DCP,    QUICK_CHARGE_NORMAL },
 	{ POWER_SUPPLY_TYPE_USB_CDP,    QUICK_CHARGE_NORMAL },
@@ -8241,9 +7474,7 @@ struct quick_charge adapter_cap[] = {
 	{ POWER_SUPPLY_TYPE_USB_PD,       QUICK_CHARGE_FAST },
 	{ POWER_SUPPLY_TYPE_USB_HVDCP,    QUICK_CHARGE_FAST },
 	{ POWER_SUPPLY_TYPE_USB_HVDCP_3,  QUICK_CHARGE_FAST },
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	{ POWER_SUPPLY_TYPE_USB_HVDCP_3P5,  QUICK_CHARGE_FLASH },
-#endif
 	{ POWER_SUPPLY_TYPE_WIRELESS,     QUICK_CHARGE_FAST },
 	{0, 0},
 };
@@ -8258,7 +7489,6 @@ int smblib_get_quick_charge_type(struct smb_charger *chg)
 		return -EINVAL;
 	}
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	rc = smblib_get_prop_batt_health(chg, &pval);
 	if (rc < 0)
 		smblib_err(chg, "Couldn't get batt health rc=%d\n", rc);
@@ -8278,21 +7508,6 @@ int smblib_get_quick_charge_type(struct smb_charger *chg)
 
 	if ((chg->real_charger_type == POWER_SUPPLY_TYPE_USB_DCP) && chg->hvdcp_recheck_status)
 		return QUICK_CHARGE_FAST;
-#else
-	rc = smblib_get_prop_batt_status(chg, &pval);
-	if (rc < 0)
-		return -EINVAL;
-
-	if (pval.intval == POWER_SUPPLY_STATUS_DISCHARGING)
-		return 0;
-
-	if ((chg->real_charger_type == POWER_SUPPLY_TYPE_USB_PD) && chg->pd_verifed) {
-		return QUICK_CHARGE_FLASH;
-	}
-
-	if (chg->is_qc_class_b)
-		return QUICK_CHARGE_FLASH;
-#endif
 
 	while (adapter_cap[i].adap_type != 0) {
 		if (chg->real_charger_type == adapter_cap[i].adap_type) {
@@ -8303,7 +7518,6 @@ int smblib_get_quick_charge_type(struct smb_charger *chg)
 
 	return 0;
 }
-#endif
 
 /* triggers when HVDCP 3.0 authentication has finished */
 static void smblib_handle_hvdcp_3p0_auth_done(struct smb_charger *chg,
@@ -8315,30 +7529,37 @@ static void smblib_handle_hvdcp_3p0_auth_done(struct smb_charger *chg,
 	if (!rising)
 		return;
 
-#ifdef CONFIG_MACH_XIAOMI_NABU
-	if (chg->qc3p5_supported) {
-		/* Run QC3P5 Authentication */
-		if (!chg->qc3p5_authentication_started) {
-			rc = qc3p5_authenticate(chg);
-			if (rc < 0) {
-				chg->qc3p5_authenticated = false;
-				dev_err(chg->dev, "QC3.5 Authentication Failed, rc=%d\n", rc);
-			}
-			chg->qc3p5_auth_complete = true;
-			/* Release 500mA QC3.5 Authentication vote */
-			vote(chg->usb_icl_votable, QC3P5_VOTER, false, 0);
-		}
-		smblib_update_usb_type(chg);
-	}
-#endif
-
 	if (chg->mode == PARALLEL_MASTER)
 		vote(chg->pl_enable_votable_indirect, USBIN_V_VOTER, true, 0);
 
 	/* the APSD done handler will set the USB supply type */
 	apsd_result = smblib_get_apsd_result(chg);
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
+	if (apsd_result->bit & QC_3P0_BIT) {
+		/* for QC3, switch to CP if present */
+		if (chg->sec_cp_present) {
+			rc = smblib_select_sec_charger(chg,
+				POWER_SUPPLY_CHARGER_SEC_CP,
+				POWER_SUPPLY_CP_HVDCP3, false);
+			if (rc < 0)
+				dev_err(chg->dev,
+				"Couldn't enable secondary chargers  rc=%d\n",
+					rc);
+		}
+
+		/* QC3.5 detection timeout */
+		if (!chg->apsd_ext_timeout &&
+				!timer_pending(&chg->apsd_timer)) {
+			smblib_dbg(chg, PR_MISC,
+				"APSD Extented timer started at %lld\n",
+				jiffies_to_msecs(jiffies));
+
+			mod_timer(&chg->apsd_timer,
+				msecs_to_jiffies(APSD_EXTENDED_TIMEOUT_MS)
+				+ jiffies);
+		}
+	}
+
 	/* for QC3, switch to CP if present */
 	if ((apsd_result->bit & QC_3P0_BIT)
 			&& (chg->sec_cp_present || chg->use_bq_pump)) {
@@ -8380,58 +7601,6 @@ static void smblib_handle_hvdcp_3p0_auth_done(struct smb_charger *chg,
 		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 				HVDCP2_CURRENT_UA);
 	}
-#elif defined(CONFIG_MACH_XIAOMI_SM8150)
-	/* for QC3, switch to CP if present */
-	if ((apsd_result->bit & QC_3P0_BIT) && chg->sec_cp_present) {
-		if (!chg->qc_class_ab) {
-			rc = smblib_select_sec_charger(chg, POWER_SUPPLY_CHARGER_SEC_CP,
-						POWER_SUPPLY_CP_HVDCP3, false);
-			if (rc < 0)
-				dev_err(chg->dev,
-					"Couldn't enable secondary chargers  rc=%d\n", rc);
-		} else {
-			if (!chg->detect_low_power_qc3_charger) {
-				vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
-						HVDCP_START_CURRENT_UA);
-				schedule_delayed_work(&chg->raise_qc3_vbus_work, 0);
-				chg->detect_low_power_qc3_charger = true;
-			}
-		}
-	} else if (apsd_result->bit & QC_2P0_BIT
-			&& !chg->qc2_unsupported) {
-		pr_info("force 9V for QC2 charger\n");
-		rc = smblib_force_vbus_voltage(chg, FORCE_9V_BIT);
-		if (rc < 0)
-			pr_err("Failed to force 9V\n");
-		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
-				HVDCP2_CURRENT_UA);
-	}
-#else
-	if (apsd_result->bit & QC_3P0_BIT) {
-		/* for QC3, switch to CP if present */
-		if (chg->sec_cp_present) {
-			rc = smblib_select_sec_charger(chg,
-				POWER_SUPPLY_CHARGER_SEC_CP,
-				POWER_SUPPLY_CP_HVDCP3, false);
-			if (rc < 0)
-				dev_err(chg->dev,
-				"Couldn't enable secondary chargers  rc=%d\n",
-					rc);
-		}
-
-		/* QC3.5 detection timeout */
-		if (!chg->apsd_ext_timeout &&
-				!timer_pending(&chg->apsd_timer)) {
-			smblib_dbg(chg, PR_MISC,
-				"APSD Extented timer started at %lld\n",
-				jiffies_to_msecs(jiffies));
-
-			mod_timer(&chg->apsd_timer,
-				msecs_to_jiffies(APSD_EXTENDED_TIMEOUT_MS)
-				+ jiffies);
-		}
-	}
-#endif
 
 	smblib_dbg(chg, PR_INTERRUPT, "IRQ: hvdcp-3p0-auth-done rising; %s detected\n",
 		   apsd_result->name);
@@ -8448,40 +7617,23 @@ static void smblib_handle_hvdcp_check_timeout(struct smb_charger *chg,
 					CHARGER_TYPE_VOTER, false, 0);
 			vote(chg->hdc_irq_disable_votable,
 					CHARGER_TYPE_VOTER, false, 0);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 			if (!chg->raise_vbus_to_detect
 					&& chg->real_charger_type != POWER_SUPPLY_TYPE_USB_HVDCP_3P5) {
 				if (chg->is_qc_class_a) {
-					vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, // git
+					vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 						HVDCP_CLASS_A_MAX_UA);
 				} else if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP) {
-					vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, // git
+					vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 						HVDCP2_CURRENT_UA);
 				} else {
 					if (chg->six_pin_step_charge_enable || chg->use_bq_pump)
-						vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, // git
+						vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 							HVDCP_CLASS_B_CURRENT_UA);
 					else
-						vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, // git
+						vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 							HVDCP_CLASS_A_FOR_CP_UA);
 				}
 			}
-#elif defined(CONFIG_MACH_XIAOMI_SM8150)
-			if (!chg->raise_vbus_to_detect) {
-				if (chg->is_qc_class_a)
-					vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, // git
-						HVDCP_CLASS_A_MAX_UA);
-				else if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP)
-					vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, // git
-						HVDCP2_CURRENT_UA);
-				else
-					vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, // git
-						HVDCP_CURRENT_UA);
-			}
-#else
-			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
-				HVDCP_CURRENT_UA);
-#endif
 		} else {
 			/* A plain DCP, enforce DCP ICL if specified */
 			vote(chg->usb_icl_votable, DCP_VOTER,
@@ -8503,12 +7655,7 @@ static void smblib_handle_hvdcp_detect_done(struct smb_charger *chg,
 
 static void update_sw_icl_max(struct smb_charger *chg, int pst)
 {
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	union power_supply_propval val = {0, };
-#else
-	int typec_mode;
-	int rp_ua;
-#endif
 
 	/* while PD is active it should have complete ICL control */
 	if (chg->pd_active)
@@ -8520,124 +7667,58 @@ static void update_sw_icl_max(struct smb_charger *chg, int pst)
 	}
 
 	/*
-	 * HVDCP 2/3, handled separately
+	 * HVDCP 2/3/3.5, handled separately
 	 */
 	if (pst == POWER_SUPPLY_TYPE_USB_HVDCP
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
-			|| pst == POWER_SUPPLY_TYPE_USB_HVDCP_3P5
-#endif
-			|| pst == POWER_SUPPLY_TYPE_USB_HVDCP_3)
+			|| pst == POWER_SUPPLY_TYPE_USB_HVDCP_3
+			|| pst == POWER_SUPPLY_TYPE_USB_HVDCP_3P5)
 		return;
-
-#if !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-	/* TypeC rp med or high, use rp value */
-	typec_mode = smblib_get_prop_typec_mode(chg);
-	if (typec_rp_med_high(chg, typec_mode)) {
-		rp_ua = get_rp_based_dcp_current(chg, typec_mode);
-		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, rp_ua);
-		return;
-	}
-#endif
 
 	/* rp-std or legacy, USB BC 1.2 */
 	switch (pst) {
 	case POWER_SUPPLY_TYPE_USB:
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		smblib_get_prop_usb_present(chg, &val);
-#endif
 		/*
 		 * USB_PSY will vote to increase the current to 500/900mA once
 		 * enumeration is done.
 		 */
 		if (!is_client_vote_enabled(chg->usb_icl_votable,
 						USB_PSY_VOTER)) {
-			/* Set current for DC_IN or uUSB based on flash
-			 * active.
-			 */
-			if (chg->dcin_uusb_over_gpio_en &&
-				gpio_is_valid(chg->dc_9v_gpio) &&
-				gpio_get_value(chg->dc_9v_gpio))
-				vote(chg->usb_icl_votable, GPIO_DCIN_VOTER,
-					true, is_flash_active(chg) ?
-						SDP_CURRENT_UA :
-						DCP_CURRENT_UA);
-			else
-				/* if flash is active force 500mA */
-#if !defined(CONFIG_MACH_XIAOMI_SM8150) || defined(CONFIG_MACH_XIAOMI_VAYU)
-				vote(chg->usb_icl_votable, USB_PSY_VOTER, true,
-						is_flash_active(chg) ?
-						SDP_CURRENT_UA : SDP_100_MA);
-#elif defined(CONFIG_MACH_XIAOMI_NABU)
-				vote(chg->usb_icl_votable, USB_PSY_VOTER, true, SDP_CURRENT_UA);
-#else
-				vote(chg->usb_icl_votable, USB_PSY_VOTER, true,
-						is_flash_active(chg) ?
-						SDP_CURRENT_UA : USBIN_500MA);
-#endif
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
+			/* if flash is active force 500mA */
+			vote(chg->usb_icl_votable, USB_PSY_VOTER, true,
+					is_flash_active(chg) ?
+					SDP_CURRENT_UA : SDP_100_MA);
 			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, false, 0);
-#endif
-		}
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
-		else if ((chg->typec_mode == POWER_SUPPLY_TYPEC_NONE) && (val.intval == true))
+		} else if ((chg->typec_mode == POWER_SUPPLY_TYPEC_NONE) && (val.intval == true))
 			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, SDP_CURRENT_UA);
 		else
-#endif
-		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, false, 0);
+			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, false, 0);
 		break;
 	case POWER_SUPPLY_TYPE_USB_CDP:
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		if (is_client_vote_enabled(chg->usb_icl_votable,
 							USB_PSY_VOTER))
 			vote(chg->usb_icl_votable, USB_PSY_VOTER, false, 0);
-#endif
 		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
 					CDP_CURRENT_UA);
 		break;
 	case POWER_SUPPLY_TYPE_USB_DCP:
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
-		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, DCP_CURRENT_UA);
-#else
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-		if (is_client_vote_enabled(chg->usb_icl_votable,
-							USB_PSY_VOTER))
-			vote(chg->usb_icl_votable, USB_PSY_VOTER, false, 0);
-#endif
-		rp_ua = get_rp_based_dcp_current(chg, typec_mode);
-		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, rp_ua);
-#endif
+		vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
+                    DCP_CURRENT_UA);
 		break;
 	case POWER_SUPPLY_TYPE_USB_FLOAT:
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		if (is_client_vote_enabled(chg->usb_icl_votable,
 							USB_PSY_VOTER))
 			vote(chg->usb_icl_votable, USB_PSY_VOTER, false, 0);
-#endif
 		/*
-		 * If DC_IN or uUSB is detected then vote
-		 * for DCP current.
+		 * limit ICL to 100mA, the USB driver will enumerate to check
+		 * if this is a SDP and appropriately set the current
 		 */
-		if (chg->dcin_uusb_over_gpio_en &&
-			gpio_is_valid(chg->dc_9v_gpio) &&
-			gpio_get_value(chg->dc_9v_gpio))
-			vote(chg->usb_icl_votable, GPIO_DCIN_VOTER,
-				true, DCP_CURRENT_UA);
+		if (!chg->recheck_charger)
+			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
+						SDP_100_MA);
 		else
-			/*
-			 * limit ICL to 100mA, the USB driver will
-			 * enumerate to check if this is a SDP and
-			 * appropriately set the current.
-			 */
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-		    if (!chg->recheck_charger)
-#endif
-			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER,
-					true, SDP_100_MA);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-		    else
-				vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER,
-						true, FLOAT_CHARGER_UA);
-#endif
+			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
+						FLOAT_CHARGER_UA);
 		break;
 	case POWER_SUPPLY_TYPE_UNKNOWN:
 	default:
@@ -8647,7 +7728,7 @@ static void update_sw_icl_max(struct smb_charger *chg, int pst)
 	}
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
+#ifdef CONFIG_THERMAL
 static void determine_thermal_current(struct smb_charger *chg)
 {
 	if (chg->system_temp_level > 0
@@ -8676,23 +7757,14 @@ static void smblib_handle_apsd_done(struct smb_charger *chg, bool rising)
 	case SDP_CHARGER_BIT:
 	case CDP_CHARGER_BIT:
 	case FLOAT_CHARGER_BIT:
-		if (chg->use_extcon) {
-			if (!chg->dcin_uusb_over_gpio_en) {
-				smblib_notify_device_mode(chg, true);
-			} else if (gpio_is_valid(chg->dc_9v_gpio) &&
-					!gpio_get_value(chg->dc_9v_gpio)) {
-				smblib_notify_device_mode(chg, true);
-			}
-		}
-#ifdef CONFIG_MACH_XIAOMI_SM8150
+		if (chg->use_extcon)
+			smblib_notify_device_mode(chg, true);
 		/* if floated charger is detected, and audio accessory set icl to 500 */
 		if (chg->typec_mode == POWER_SUPPLY_TYPEC_SINK_AUDIO_ADAPTER)
 			vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, 500000);
-#endif
 		break;
 	case OCP_CHARGER_BIT:
 	case DCP_CHARGER_BIT:
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		if (chg->typec_mode == POWER_SUPPLY_TYPEC_SINK_AUDIO_ADAPTER){
 			chg->real_charger_type = POWER_SUPPLY_TYPE_USB_FLOAT;
 			chg->usb_psy_desc.type = POWER_SUPPLY_TYPE_USB_FLOAT;
@@ -8703,17 +7775,16 @@ static void smblib_handle_apsd_done(struct smb_charger *chg, bool rising)
 			if (get_client_vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER) != 500000)
 				vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, 500000);
 		}
-#endif
 		break;
 	default:
 		break;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
+#ifdef CONFIG_THERMAL
 	determine_thermal_current(chg);
 #endif
 
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: apsd-done rising; %s detected\n",
+	smblib_dbg(chg, PR_OEM, "IRQ: apsd-done rising; %s detected\n",
 		   apsd_result->name);
 }
 
@@ -8723,10 +7794,8 @@ irqreturn_t usb_source_change_irq_handler(int irq, void *data)
 	struct smb_charger *chg = irq_data->parent_data;
 	int rc = 0;
 	u8 stat;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (chg->fake_usb_insertion)
 		return IRQ_HANDLED;
-#endif
 
 	/* PD session is ongoing, ignore BC1.2 and QC detection */
 	if (chg->pd_active)
@@ -8737,7 +7806,7 @@ irqreturn_t usb_source_change_irq_handler(int irq, void *data)
 		smblib_err(chg, "Couldn't read APSD_STATUS rc=%d\n", rc);
 		return IRQ_HANDLED;
 	}
-	smblib_dbg(chg, PR_INTERRUPT, "APSD_STATUS = 0x%02x\n", stat);
+	smblib_dbg(chg, PR_OEM, "APSD_STATUS = 0x%02x\n", stat);
 
 	if ((chg->connector_type == POWER_SUPPLY_CONNECTOR_MICRO_USB)
 		&& (stat & APSD_DTC_STATUS_DONE_BIT)
@@ -8781,7 +7850,7 @@ irqreturn_t usb_source_change_irq_handler(int irq, void *data)
 		smblib_err(chg, "Couldn't read APSD_STATUS rc=%d\n", rc);
 		return IRQ_HANDLED;
 	}
-	smblib_dbg(chg, PR_INTERRUPT, "APSD_STATUS = 0x%02x\n", stat);
+	smblib_dbg(chg, PR_OEM, "APSD_STATUS = 0x%02x\n", stat);
 
 	return IRQ_HANDLED;
 }
@@ -8818,16 +7887,13 @@ enum alarmtimer_restart smblib_lpd_recheck_timer(struct alarm *alarm,
 	chg->lpd_stage = LPD_STAGE_NONE;
 	chg->lpd_reason = LPD_NONE;
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (chg->support_liquid == true) {
 		schedule_work(&chg->lpd_disable_chg_work);
 	}
-#endif
 
 	return ALARMTIMER_NORESTART;
 }
 
-#define RSBU_K_300K_UV	3000000
 static bool smblib_src_lpd(struct smb_charger *chg)
 {
 	union power_supply_propval pval;
@@ -8857,14 +7923,12 @@ static bool smblib_src_lpd(struct smb_charger *chg)
 		break;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	chg->typec_mode = smblib_get_prop_typec_mode(chg);
 	if ((chg->typec_mode == POWER_SUPPLY_TYPEC_SINK_AUDIO_ADAPTER)
 					&& (chg->support_liquid == true)) {
 		lpd_flag = false;
 		return lpd_flag;
 	}
-#endif
 
 	if (lpd_flag) {
 		chg->lpd_stage = LPD_STAGE_COMMIT;
@@ -8875,7 +7939,6 @@ static bool smblib_src_lpd(struct smb_charger *chg)
 				pval.intval, rc);
 		chg->lpd_reason = LPD_MOISTURE_DETECTED;
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		chg->lpd_status = true;
 
 		if (chg->support_liquid == true) {
@@ -8885,12 +7948,12 @@ static bool smblib_src_lpd(struct smb_charger *chg)
 		}
 		alarm_start_relative(&chg->lpd_recheck_timer,
 						ms_to_ktime(15000));
-#endif
 
 		chg->moisture_present =  true;
 		alarm_start_relative(&chg->lpd_recheck_timer,
 						ms_to_ktime(60000));
 		power_supply_changed(chg->usb_psy);
+
 	} else {
 		chg->lpd_reason = LPD_NONE;
 		chg->typec_mode = smblib_get_prop_typec_mode(chg);
@@ -8913,16 +7976,11 @@ static void typec_src_fault_condition_cfg(struct smb_charger *chg, bool src)
 
 static void typec_sink_insertion(struct smb_charger *chg)
 {
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	int rc = 0;
 	int usb_present = 0;
 	int typec_mode;
 	union power_supply_propval pval = {0, };
-#else
-	int rc;
-#endif
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	rc = smblib_get_prop_usb_present(chg, &pval);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't get usb present rc = %d\n", rc);
@@ -8942,9 +8000,9 @@ static void typec_sink_insertion(struct smb_charger *chg)
 	} else {
 		vote(chg->usb_icl_votable, OTG_VOTER, true, 0);
 	}
-#endif
 
 	typec_src_fault_condition_cfg(chg, true);
+
 	rc = smblib_set_charge_param(chg, &chg->param.freq_switcher,
 					chg->chg_freq.freq_above_otg_threshold);
 	if (rc < 0)
@@ -8998,9 +8056,7 @@ static void typec_sink_removal(struct smb_charger *chg)
 {
 	int rc;
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	vote(chg->usb_icl_votable, OTG_VOTER, false, 0);
-#endif
 	typec_src_fault_condition_cfg(chg, false);
 	rc = smblib_set_charge_param(chg, &chg->param.freq_switcher,
 					chg->chg_freq.freq_removal);
@@ -9030,19 +8086,8 @@ static void typec_src_removal(struct smb_charger *chg)
 		dev_err(chg->dev,
 			"Couldn't disable secondary charger rc=%d\n", rc);
 
-#ifdef CONFIG_MACH_XIAOMI_NABU
-	/* Reset QC3.5 Flag and power limit*/
-	chg->qc3p5_authenticated = false;
-	chg->qc3p5_auth_complete = false;
-	chg->qc3p5_authentication_started = false;
-	chg->qc3p5_dp_tune_rapidly = false;
-	chg->qc3p5_power_limit_w = 18;
-#endif
-
 	chg->qc3p5_detected = false;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	chg->snk_debug_acc_detected = false;
-#endif
 
 	typec_src_fault_condition_cfg(chg, false);
 	smblib_hvdcp_detect_enable(chg, false);
@@ -9060,15 +8105,8 @@ static void typec_src_removal(struct smb_charger *chg)
 	}
 
 	cancel_delayed_work_sync(&chg->pl_enable_work);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	cancel_delayed_work_sync(&chg->raise_qc3_vbus_work);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	cancel_delayed_work_sync(&chg->check_init_boot);
-#endif
-#endif
-#ifdef CONFIG_CHARGER_LN8000
-	cancel_delayed_work_sync(&chg->check_vbat_work);
-#endif
 
 	/* reset input current limit voters */
 	vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true,
@@ -9077,16 +8115,11 @@ static void typec_src_removal(struct smb_charger *chg)
 	vote(chg->usb_icl_votable, USB_PSY_VOTER, false, 0);
 	vote(chg->usb_icl_votable, DCP_VOTER, false, 0);
 	vote(chg->usb_icl_votable, SW_QC3_VOTER, false, 0);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	vote(chg->usb_icl_votable, OTG_VOTER, false, 0);
-#endif
 	vote(chg->usb_icl_votable, CTM_VOTER, false, 0);
 	vote(chg->usb_icl_votable, HVDCP2_ICL_VOTER, false, 0);
 	vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, false, 0);
 	vote(chg->usb_icl_votable, THERMAL_THROTTLE_VOTER, false, 0);
-#ifdef CONFIG_MACH_XIAOMI_NABU
-	vote(chg->usb_icl_votable, QC3P5_VOTER, false, 0);
-#endif
 
 	/* reset usb irq voters */
 	vote(chg->limited_irq_disable_votable, CHARGER_TYPE_VOTER,
@@ -9100,28 +8133,19 @@ static void typec_src_removal(struct smb_charger *chg)
 	vote(chg->pl_enable_votable_indirect, USBIN_I_VOTER, false, 0);
 	vote(chg->pl_enable_votable_indirect, USBIN_V_VOTER, false, 0);
 	vote(chg->awake_votable, PL_DELAY_VOTER, false, 0);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	/* reset our own voters */
 	/* clear chg_awake wakeup source when typec removal */
 	vote(chg->awake_votable, CHG_AWAKE_VOTER, false, 0);
 	vote(chg->fcc_votable, CLASSA_QC_FCC_VOTER, false, 0);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	vote(chg->fcc_votable, PD_REMOVE_COMP_VOTER, false, 0);
 	vote(chg->fcc_votable, PD_VERIFED_VOTER, true, PD_UNVERIFED_CURRENT);
-#endif
 	vote(chg->usb_icl_votable, QC_A_CP_ICL_MAX_VOTER, false, 0);
 	vote(chg->usb_icl_votable, QC2_UNSUPPORTED_VOTER, false, 0);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->use_bq_pump) {
 		vote(chg->usb_icl_votable, HVDCP3_START_ICL_VOTER, false, 0);
 		vote(chg->usb_icl_votable, MAIN_CHG_VOTER, false, 0);
 		vote(chg->fcc_votable, SLOWLY_CHARGING_VOTER, false, 0);
 	}
-#endif
-#if !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-	vote(chg->usb_icl_votable, PD_VERIFED_VOTER, false, 0);
-#endif
-#endif
 
 	/* Remove SW thermal regulation WA votes */
 	vote(chg->usb_icl_votable, SW_THERM_REGULATION_VOTER, false, 0);
@@ -9143,7 +8167,6 @@ static void typec_src_removal(struct smb_charger *chg)
 	chg->usbin_forced_max_uv = 0;
 	chg->chg_param.forced_main_fcc = 0;
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->six_pin_step_charge_enable) {
 		chg->init_start_vbat_checked = false;
 		chg->already_start_step_charge_work = false;
@@ -9153,16 +8176,9 @@ static void typec_src_removal(struct smb_charger *chg)
 		vote(chg->fcc_votable, SIX_PIN_VFLOAT_VOTER, false, 0);
 		cancel_delayed_work_sync(&chg->six_pin_batt_step_chg_work);
 	}
-#endif
-#ifdef CONFIG_CHARGER_LN8000
-	vote(chg->fv_votable, BATT_BQ2597X_VOTER, false, 0);
-#endif
 
 	/* Reset CC mode votes */
 	vote(chg->fcc_main_votable, MAIN_FCC_VOTER, false, 0);
-#ifdef CONFIG_MACH_XIAOMI_NABU
-	vote(chg->fcc_votable, FCC_MAX_QC3P5_VOTER, false, 0);
-#endif
 	chg->adapter_cc_mode = 0;
 	chg->thermal_overheat = 0;
 	vote_override(chg->fcc_votable, CC_MODE_VOTER, false, 0);
@@ -9176,13 +8192,11 @@ static void typec_src_removal(struct smb_charger *chg)
 	if (rc < 0)
 		smblib_err(chg, "Couldn't write float charger options rc=%d\n",
 			rc);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->qc_class_ab) {
 		rc = smblib_force_vbus_voltage(chg, FORCE_5V_BIT);
 		if (rc < 0)
 			pr_err("Failed to force 5V\n");
 	}
-#endif
 
 	if (!chg->pr_swap_in_progress) {
 		rc = smblib_usb_pd_adapter_allowance_override(chg, FORCE_NULL);
@@ -9221,7 +8235,6 @@ static void typec_src_removal(struct smb_charger *chg)
 	if (chg->use_extcon)
 		smblib_notify_device_mode(chg, false);
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->support_ffc) {
 		if (smblib_get_fastcharge_mode(chg) == 1)
 			smblib_set_fastcharge_mode(chg, false);
@@ -9232,13 +8245,11 @@ static void typec_src_removal(struct smb_charger *chg)
 
 	/* when src removal, set bark timer back to default 16s */
 	smblib_set_wdog_bark_timer(chg, BARK_TIMER_NORMAL);
-#endif
 
 	chg->typec_legacy = false;
 
 	del_timer_sync(&chg->apsd_timer);
 	chg->apsd_ext_timeout = false;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	chg->detect_low_power_qc3_charger = false;
 	chg->raise_vbus_to_detect = false;
 	chg->is_qc_class_a = false;
@@ -9248,24 +8259,16 @@ static void typec_src_removal(struct smb_charger *chg)
 	chg->cc_un_compliant_detected = false;
 	chg->recheck_charger = false;
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	chg->slowly_charging = false;
 	chg->pps_thermal_level = -EINVAL;
-#endif
-#ifdef CONFIG_CHARGER_LN8000
-	fv_over_limit_times = 0;
-#endif
 	pr_err("%s:", __func__);
 	if (chg->pd_verifed) {
 		chg->pd_verifed = false;
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		if (chg->support_ffc) {
 			if (smblib_get_fastcharge_mode(chg) == true)
 				smblib_set_fastcharge_mode(chg, false);
 		}
-#endif
 	}
-#endif
 }
 
 static void typec_mode_unattached(struct smb_charger *chg)
@@ -9328,7 +8331,7 @@ irqreturn_t typec_or_rid_detection_change_irq_handler(int irq, void *data)
 	struct smb_irq_data *irq_data = data;
 	struct smb_charger *chg = irq_data->parent_data;
 
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
+	smblib_dbg(chg, PR_OEM, "IRQ: %s\n", irq_data->name);
 
 	if (chg->connector_type == POWER_SUPPLY_CONNECTOR_MICRO_USB) {
 		if (chg->uusb_moisture_protection_enabled) {
@@ -9385,7 +8388,7 @@ irqreturn_t typec_state_change_irq_handler(int irq, void *data)
 		smblib_handle_rp_change(chg, typec_mode);
 	chg->typec_mode = typec_mode;
 
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: cc-state-change; Type-C %s detected\n",
+	smblib_dbg(chg, PR_OEM, "IRQ: cc-state-change; Type-C %s detected\n",
 				smblib_typec_mode_name[chg->typec_mode]);
 
 	power_supply_changed(chg->usb_psy);
@@ -9434,7 +8437,7 @@ irqreturn_t typec_attach_detach_irq_handler(int irq, void *data)
 	bool attached = false;
 	int rc;
 
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
+	smblib_dbg(chg, PR_OEM, "IRQ: %s\n", irq_data->name);
 
 	rc = smblib_read(chg, TYPE_C_STATE_MACHINE_STATUS_REG, &stat);
 	if (rc < 0) {
@@ -9448,10 +8451,8 @@ irqreturn_t typec_attach_detach_irq_handler(int irq, void *data)
 	if (attached) {
 		smblib_lpd_clear_ra_open_work(chg);
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		if (chg->lpd_status)
 			chg->lpd_status = false;
-#endif
 
 		rc = smblib_read(chg, TYPE_C_MISC_STATUS_REG, &stat);
 		if (rc < 0) {
@@ -9472,9 +8473,6 @@ irqreturn_t typec_attach_detach_irq_handler(int irq, void *data)
 		} else {
 			chg->sink_src_mode = SINK_MODE;
 			typec_src_insertion(chg);
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-			smblib_wireless_set_enable(chg, false);
-#endif
 		}
 
 		if (chg->typec_role_swap_failed) {
@@ -9492,9 +8490,6 @@ irqreturn_t typec_attach_detach_irq_handler(int irq, void *data)
 		case SINK_MODE:
 		case AUDIO_ACCESS_MODE:
 			typec_src_removal(chg);
-#if defined(CONFIG_MACH_XIAOMI_SM8150) && !(defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU))
-			smblib_wireless_set_enable(chg, true);
-#endif
 			break;
 		case UNATTACHED_MODE:
 		default:
@@ -9538,72 +8533,6 @@ irqreturn_t typec_attach_detach_irq_handler(int irq, void *data)
 
 	return IRQ_HANDLED;
 }
-
-#ifdef CONFIG_MACH_XIAOMI_NABU
-/*add for wireless reverse charge to disable dc*/
-int smblib_set_sw_disable_dc_en(struct smb_charger *chg,
-				const union power_supply_propval *val)
-{
-	int rc = 0;
-
-	if (val->intval) {
-		/* step1: enter dc suspend */
-		rc = vote(chg->dc_suspend_votable, SW_DISABLE_DC_VOTER,
-			true, 0);
-
-		/* step2: force dcin_en low */
-		rc = smblib_masked_write(chg, DCIN_CMD_IL_REG,
-						 DCIN_EN_OVERRIDE_BIT | DCIN_EN_BIT,
-						 DCIN_EN_OVERRIDE_BIT);
-		if (rc < 0) {
-			dev_err(chg->dev, "Couldn't configure dc_en override rc=%d\n", rc);
-			return rc;
-		}
-
-		/* step3: enable pull-down on dcin_pon and mid_chg */
-		rc = smblib_masked_write(chg, DCIN_CMD_PULLDOWN_REG,
-						 DCIN_PULLDOWN_EN_BIT | DCIN_MID_PULLDOWN_BIT,
-						 DCIN_PULLDOWN_EN_BIT | DCIN_MID_PULLDOWN_BIT);
-		if (rc < 0) {
-			dev_err(chg->dev, "Couldn't enable dcin_pulldown rc=%d\n", rc);
-			return rc;
-		}
-		/* wait 10ms to pull mid_chg lower than Vsys+Vrevi */
-		msleep(10);
-
-		/* step4: exit dc suspend */
-		rc = vote(chg->dc_suspend_votable, SW_DISABLE_DC_VOTER,
-			false, 0);
-	} else {
-		/* step1: enter dc suspend */
-		rc = vote(chg->dc_suspend_votable, SW_DISABLE_DC_VOTER,
-			true, 0);
-
-		/* step2: force dcin_en low */
-		rc = smblib_masked_write(chg, DCIN_CMD_IL_REG,
-						 DCIN_EN_OVERRIDE_BIT, 0);
-		if (rc < 0) {
-			dev_err(chg->dev, "Couldn't configure dc_en override rc=%d\n", rc);
-			return rc;
-		}
-
-		/* step3: enable pull-down on dcin_pon and mid_chg */
-		rc = smblib_masked_write(chg, DCIN_CMD_PULLDOWN_REG,
-						 DCIN_PULLDOWN_EN_BIT | DCIN_MID_PULLDOWN_BIT, 0);
-		if (rc < 0) {
-			dev_err(chg->dev, "Couldn't disable dcin_pulldown rc=%d\n", rc);
-			return rc;
-		}
-		/* wait 10ms to pull mid_chg lower than Vsys+Vrevi */
-		msleep(10);
-		/* step4: exit dc suspend */
-		rc = vote(chg->dc_suspend_votable, SW_DISABLE_DC_VOTER,
-			false, 0);
-	}
-
-	return 0;
-}
-#endif
 
 static void dcin_aicl(struct smb_charger *chg)
 {
@@ -9750,7 +8679,6 @@ irqreturn_t dcin_uv_irq_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 static int smblib_get_wireless_output_vol(struct smb_charger *chg)
 {
 
@@ -9797,6 +8725,7 @@ int smblib_set_wirless_cp_enable(struct smb_charger *chg,
 		if (rc < 0)
 			dev_err(chg->dev,
 					"Couldn't enable secondary chargers  rc=%d\n", rc);
+		smblib_dbg(chg, PR_OEM, "enable cp by wireless\n");
 	} else
 		smblib_dbg(chg, PR_WLS, "dcin_not present or usbin_present\n");
 
@@ -9810,6 +8739,7 @@ int smblib_set_wirless_power_good_enable(struct smb_charger *chg,
 
 	chg->power_good_en = val->intval;
 	if (chg->power_good_en) {
+		smblib_dbg(chg, PR_OEM, "power good on\n");
 		chg->fake_dc_on = 1;
 		chg->fake_dc_flag = 0;
 		chg->last_batt_stat = 0;
@@ -9820,6 +8750,7 @@ int smblib_set_wirless_power_good_enable(struct smb_charger *chg,
 	else {
 		if (!chg->fake_dc_flag)
 			chg->fake_dc_on = 0;
+		smblib_dbg(chg, PR_OEM, "power good off, set dc_en sw override\n");
 		/* step1: enter dc suspend */
 		rc = vote(chg->dc_suspend_votable, OTG_VOTER,
 			true, 0);
@@ -9886,24 +8817,16 @@ static void smblib_dc_plug_out_work(struct work_struct *work)
 	smblib_dbg(chg, PR_WLS, "Delay timeout and clear dc fake value\n");
 	vote(chg->awake_votable, DC_UV_AWAKE_VOTER, false, 0);
 }
-#endif
 
 irqreturn_t dc_plugin_irq_handler(int irq, void *data)
 {
 	struct smb_irq_data *irq_data = data;
 	struct smb_charger *chg = irq_data->parent_data;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	union power_supply_propval pval = {0, };
-#else
-	union power_supply_propval pval;
-#endif
 	int input_present;
 	bool dcin_present, vbus_present;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
+	//int rc, wireless_vout = 0;
 	int rc;
-#else
-	int rc, wireless_vout = 0;
-#endif
 	int sec_charger;
 
 	rc = smblib_get_prop_vph_voltage_now(chg, &pval);
@@ -9911,89 +8834,26 @@ irqreturn_t dc_plugin_irq_handler(int irq, void *data)
 		return IRQ_HANDLED;
 
 	/* 2*VPH, with a granularity of 100mV */
-#ifndef CONFIG_MACH_XIAOMI_SM8150
-	wireless_vout = ((pval.intval * 2) / 100000) * 100000;
-#endif
+	//wireless_vout = ((pval.intval * 2) / 100000) * 100000;
 
 	rc = smblib_is_input_present(chg, &input_present);
 	if (rc < 0)
 		return IRQ_HANDLED;
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	chg->idtp_psy = power_supply_get_by_name("idt");
 	if (!chg->idtp_psy)
 		dev_err(chg->dev, "Could not get idtp psy\n");
-#endif
 
 	dcin_present = input_present & INPUT_PRESENT_DC;
 	vbus_present = input_present & INPUT_PRESENT_USB;
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	/* when dcin present and in otg mode, set vbus present to 0*/
 	if (smblib_get_prop_dfp_mode(chg) != POWER_SUPPLY_TYPEC_NONE
 			&& smblib_get_prop_dfp_mode(chg)
 			!= POWER_SUPPLY_TYPEC_SINK_AUDIO_ADAPTER
 			&& dcin_present)
 		vbus_present = 0;
-#endif
 
-#ifndef CONFIG_MACH_XIAOMI_SM8150
-	if (dcin_present && !vbus_present) {
-		cancel_work_sync(&chg->dcin_aicl_work);
-
-		/* Reset DCIN ICL to 100 mA */
-		mutex_lock(&chg->dcin_aicl_lock);
-		rc = smblib_set_charge_param(chg, &chg->param.dc_icl,
-				DCIN_ICL_MIN_UA);
-		mutex_unlock(&chg->dcin_aicl_lock);
-		if (rc < 0)
-			return IRQ_HANDLED;
-
-		smblib_dbg(chg, (PR_WLS | PR_INTERRUPT), "reset: icl: 100 mA\n");
-
-		if (chg->sec_cp_present) {
-			pval.intval = wireless_vout;
-			rc = smblib_set_prop_voltage_wls_output(chg, &pval);
-			if (rc < 0)
-				dev_err(chg->dev, "Couldn't set dc voltage to 2*vph  rc=%d\n",
-					rc);
-
-			rc = smblib_select_sec_charger(chg,
-					POWER_SUPPLY_CHARGER_SEC_CP,
-					POWER_SUPPLY_CP_WIRELESS, false);
-			if (rc < 0)
-				dev_err(chg->dev, "Couldn't enable secondary chargers  rc=%d\n",
-					rc);
-		} else {
-			/*
-			 * If no secondary charger is present, commence
-			 * wireless charging at 5 V by default.
-			 */
-			pval.intval = 5000000;
-			rc = smblib_set_prop_voltage_wls_output(chg, &pval);
-			if (rc < 0)
-				dev_err(chg->dev, "Couldn't set dc voltage to 5 V rc=%d\n",
-					rc);
-		}
-
-		schedule_work(&chg->dcin_aicl_work);
-	} else {
-		if (chg->cp_reason == POWER_SUPPLY_CP_WIRELESS) {
-			sec_charger = chg->sec_pl_present ?
-					POWER_SUPPLY_CHARGER_SEC_PL :
-					POWER_SUPPLY_CHARGER_SEC_NONE;
-			rc = smblib_select_sec_charger(chg, sec_charger,
-					POWER_SUPPLY_CP_NONE, false);
-			if (rc < 0)
-				dev_err(chg->dev, "Couldn't disable secondary charger rc=%d\n",
-					rc);
-		}
-
-		vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER, false, 0);
-
-		chg->last_wls_vout = 0;
-	}
-#elif defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (dcin_present) {
 		if (!vbus_present && chg->sec_cp_present) {
 			chg->flag_dc_present = 1;
@@ -10055,60 +8915,10 @@ irqreturn_t dc_plugin_irq_handler(int irq, void *data)
 
 		chg->last_wls_vout = 0;
 	}
-#else
-	if (dcin_present) {
-		if (!vbus_present && chg->sec_cp_present) {
-			chg->flag_dc_present = 1;
-			vote(chg->awake_votable, DC_AWAKE_VOTER, true, 0);
-			if (chg->idtp_psy) {
-				pval.intval = true;
-				power_supply_set_property(chg->idtp_psy,
-					POWER_SUPPLY_PROP_PRESENT, &pval);
-			}
-		}
-	} else {
-		vote(chg->awake_votable, DC_AWAKE_VOTER, false, 0);
-		vote(chg->dc_icl_votable, DCIN_ADAPTER_VOTER, true, 100000);
-		chg->flag_dc_present = 0;
-		chg->cp_reason = POWER_SUPPLY_CP_NONE;
-		sec_charger = chg->sec_pl_present ?
-					POWER_SUPPLY_CHARGER_SEC_PL :
-					POWER_SUPPLY_CHARGER_SEC_NONE;
-			rc = smblib_select_sec_charger(chg, sec_charger,
-					POWER_SUPPLY_CP_NONE, false);
-
-		if (rc < 0)
-			dev_err(chg->dev,
-				"Couldn't disable secondary charger rc=%d\n",
-						rc);
-
-		if (chg->idtp_psy) {
-			pval.intval = false;
-			power_supply_set_property(chg->idtp_psy,
-						POWER_SUPPLY_PROP_PRESENT, &pval);
-		}
-
-		if (chg->cp_reason == POWER_SUPPLY_CP_WIRELESS) {
-			sec_charger = chg->sec_pl_present ?
-					POWER_SUPPLY_CHARGER_SEC_PL :
-					POWER_SUPPLY_CHARGER_SEC_NONE;
-			rc = smblib_select_sec_charger(chg, sec_charger,
-					POWER_SUPPLY_CP_NONE, false);
-			if (rc < 0)
-				dev_err(chg->dev, "Couldn't disable secondary charger rc=%d\n",
-					rc);
-		}
-
-		vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER, false, 0);
-	}
-#endif
 
 	power_supply_changed(chg->dc_psy);
-
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (chg->wls_psy)
 		power_supply_changed(chg->wls_psy);
-#endif
 
 	smblib_dbg(chg, (PR_WLS | PR_INTERRUPT), "dcin_present= %d, usbin_present= %d, cp_reason = %d\n",
 			dcin_present, vbus_present, chg->cp_reason);
@@ -10227,16 +9037,14 @@ irqreturn_t wdog_bark_irq_handler(int irq, void *data)
 	struct smb_charger *chg = irq_data->parent_data;
 	int rc;
 
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
+	smblib_dbg(chg, PR_OEM, "IRQ: %s\n", irq_data->name);
 
 	rc = smblib_write(chg, BARK_BITE_WDOG_PET_REG, BARK_BITE_WDOG_PET_BIT);
 	if (rc < 0)
 		smblib_err(chg, "Couldn't pet the dog rc=%d\n", rc);
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (chg->step_chg_enabled || chg->sw_jeita_enabled)
 		power_supply_changed(chg->batt_psy);
-#endif
 
 	return IRQ_HANDLED;
 }
@@ -10282,7 +9090,6 @@ static void smblib_usbov_dbc_work(struct work_struct *work)
 	vote(chg->awake_votable, USBOV_DBC_VOTER, false, 0);
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static int smblib_get_step_vfloat_index(struct smb_charger *chg,
 				int val)
 {
@@ -10376,7 +9183,6 @@ static void smblib_six_pin_batt_step_chg_work(struct work_struct *work)
 	schedule_delayed_work(&chg->six_pin_batt_step_chg_work,
 				msecs_to_jiffies(interval_ms));
 }
-#endif
 
 #define USB_OV_DBC_PERIOD_MS		1000
 irqreturn_t usbin_ov_irq_handler(int irq, void *data)
@@ -10416,47 +9222,6 @@ irqreturn_t usbin_ov_irq_handler(int irq, void *data)
 
 	smblib_dbg(chg, PR_MISC, "USBOV debounce status %d\n",
 				chg->dbc_usbov);
-	return IRQ_HANDLED;
-}
-
-irqreturn_t smb_micro_usb_irq_handler(int irq, void *data)
-{
-	struct smb_charger *chg = data;
-	int is_usb_present = (gpio_is_valid(chg->micro_usb_gpio) &&
-				gpio_get_value(chg->micro_usb_gpio));
-	int is_dc_9v_present = (gpio_is_valid(chg->dc_9v_gpio) &&
-					gpio_get_value(chg->dc_9v_gpio));
-
-	smblib_dbg(chg, PR_MISC, "is_usb_present = %d is_dc_9v_present = %d\n",
-				is_usb_present, is_dc_9v_present);
-
-	if (!gpio_is_valid(chg->usb_switch_gpio)) {
-		smblib_err(chg, "usb_switch_gpio valid :%d\n",
-			gpio_is_valid(chg->usb_switch_gpio));
-		return IRQ_HANDLED;
-	}
-
-	if (is_usb_present) {
-		gpio_set_value(chg->usb_switch_gpio, 0);
-		smblib_notify_usb_host(chg, false);
-	} else {
-		gpio_set_value(chg->usb_switch_gpio, 1);
-		smblib_notify_device_mode(chg, false);
-
-		if (is_dc_9v_present &&
-				chg->micro_usb_pre_state) {
-			smblib_request_dpdm(chg, false);
-			smblib_rerun_apsd_if_required(chg);
-			smblib_update_usb_type(chg);
-			schedule_delayed_work(&chg->micro_usb_switch_work,
-						msecs_to_jiffies(1500));
-			return IRQ_HANDLED;
-		}
-	}
-
-	schedule_delayed_work(&chg->micro_usb_switch_work,
-					msecs_to_jiffies(1000));
-
 	return IRQ_HANDLED;
 }
 
@@ -10547,47 +9312,6 @@ int smblib_set_prop_pr_swap_in_progress(struct smb_charger *chg,
 /***************
  * Work Queues *
  ***************/
-static void smblib_micro_usb_switch_work(struct work_struct *work)
-{
-	struct smb_charger *chg = container_of(work, struct smb_charger,
-						micro_usb_switch_work.work);
-	int is_usb_present = (gpio_is_valid(chg->micro_usb_gpio) &&
-					gpio_get_value(chg->micro_usb_gpio));
-	int is_dc_9v_present = (gpio_is_valid(chg->dc_9v_gpio) &&
-					gpio_get_value(chg->dc_9v_gpio));
-
-	if (!gpio_is_valid(chg->micro_usb_gpio) &&
-		!gpio_is_valid(chg->dc_9v_gpio)) {
-		smblib_err(chg, "Both micro_usb gpio and dc_9v_gpio are invalid\n");
-		return;
-	}
-
-	smblib_dbg(chg, PR_MISC, "is_usb_present=%d is_dc_9v_present=%d\n",
-				is_usb_present, is_dc_9v_present);
-
-	if (is_usb_present) {
-		smblib_notify_device_mode(chg, true);
-		if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_FLOAT) {
-			smblib_request_dpdm(chg, false);
-			smblib_rerun_apsd_if_required(chg);
-			smblib_update_usb_type(chg);
-		}
-
-		if (is_dc_9v_present &&
-			(chg->real_charger_type == POWER_SUPPLY_TYPE_USB))
-			smblib_handle_usb_current(chg, DCP_CURRENT_UA);
-		else if ((is_dc_9v_present == 0)
-			&& (chg->real_charger_type == POWER_SUPPLY_TYPE_USB))
-			smblib_handle_usb_current(chg, SDP_CURRENT_UA);
-	} else {
-		smblib_notify_usb_host(chg, false);
-		msleep(100);
-		smblib_notify_usb_host(chg, true);
-	}
-
-	chg->micro_usb_pre_state = is_usb_present;
-}
-
 static void smblib_pr_lock_clear_work(struct work_struct *work)
 {
 	struct smb_charger *chg = container_of(work, struct smb_charger,
@@ -11112,11 +9836,9 @@ static void jeita_update_work(struct work_struct *work)
 			chg->jeita_soft_thlds[1] + SOFT_JEITA_HYSTERESIS_OFFSET;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	/* we still use old soft jeita method */
 	chg->jeita_configured = JEITA_CFG_COMPLETE;
 	return;
-#endif
 
 	chg->jeita_soft_fcc[0] = chg->jeita_soft_fcc[1] = -EINVAL;
 	chg->jeita_soft_fv[0] = chg->jeita_soft_fv[1] = -EINVAL;
@@ -11203,8 +9925,8 @@ static void smblib_lpd_ra_open_work(struct work_struct *work)
 	/* quit if moisture status is gone or in attached state */
 	if (!(stat & TYPEC_WATER_DETECTION_STATUS_BIT)
 			|| (stat & TYPEC_TCCDEBOUNCE_DONE_STATUS_BIT)) {
+		pr_info("quit if moisture status is gone: stat val is 0x%x\n", stat);
 		chg->lpd_stage = LPD_STAGE_NONE;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		chg->lpd_status = false;
 
 		if (chg->support_liquid == true) {
@@ -11212,7 +9934,6 @@ static void smblib_lpd_ra_open_work(struct work_struct *work)
 			if (chg->batt_psy)
 				power_supply_changed(chg->batt_psy);
 		}
-#endif
 		goto out;
 	}
 
@@ -11241,18 +9962,16 @@ static void smblib_lpd_ra_open_work(struct work_struct *work)
 		}
 
 		chg->lpd_reason = LPD_MOISTURE_DETECTED;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
+
 		chg->lpd_status = true;
-#endif
+
 		chg->moisture_present =  true;
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 		if (chg->support_liquid == true) {
 			vote(chg->usb_icl_votable, LIQUID_DETECTION_VOTER, true, 0);
 			if (chg->batt_psy)
 				power_supply_changed(chg->batt_psy);
 		}
-#endif
 	} else {
 		/* Floating cable, disable water detection irq temporarily */
 		rc = smblib_masked_write(chg, TYPE_C_INTERRUPT_EN_CFG_2_REG,
@@ -11275,17 +9994,12 @@ static void smblib_lpd_ra_open_work(struct work_struct *work)
 		chg->lpd_reason = LPD_FLOATING_CABLE;
 	}
 
-	/* recheck in 60 seconds */
-#ifdef CONFIG_MACH_XIAOMI_SM8150
+	/* recheck in 15 seconds */
 	alarm_start_relative(&chg->lpd_recheck_timer, ms_to_ktime(15000));
-#else
-	alarm_start_relative(&chg->lpd_recheck_timer, ms_to_ktime(60000));
-#endif
 out:
 	vote(chg->awake_votable, LPD_VOTER, false, 0);
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 static void smblib_lpd_disable_chg_work(struct work_struct *work)
 {
 	struct smb_charger *chg = container_of(work, struct smb_charger,
@@ -11295,7 +10009,6 @@ static void smblib_lpd_disable_chg_work(struct work_struct *work)
 	if (chg->batt_psy)
 		power_supply_changed(chg->batt_psy);
 }
-#endif
 
 static void smblib_lpd_detach_work(struct work_struct *work)
 {
@@ -11306,7 +10019,6 @@ static void smblib_lpd_detach_work(struct work_struct *work)
 		chg->lpd_stage = LPD_STAGE_NONE;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 static void smblib_charger_type_recheck(struct work_struct *work)
 {
 	struct smb_charger *chg = container_of(work, struct smb_charger,
@@ -11315,19 +10027,20 @@ static void smblib_charger_type_recheck(struct work_struct *work)
 	static int last_charger_type, check_count;
 	int rc;
 	smblib_update_usb_type(chg);
+	smblib_dbg(chg, PR_OEM, "typec_mode:%d,last:%d: real charger type:%d\n",
+			chg->typec_mode, last_charger_type, chg->real_charger_type);
 
 	if (last_charger_type != chg->real_charger_type)
 		check_count--;
 	last_charger_type = chg->real_charger_type;
 
 	if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP_3 ||
-#ifdef CONFIG_MACH_XIAOMI_NABU
-			chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP_3P5 ||
-#endif
 			chg->real_charger_type == POWER_SUPPLY_TYPE_USB_HVDCP ||
 			chg->pd_active || (check_count >= TYPE_RECHECK_COUNT) ||
 			((chg->real_charger_type == POWER_SUPPLY_TYPE_USB_FLOAT) &&
 				(chg->typec_mode == POWER_SUPPLY_TYPEC_SINK_AUDIO_ADAPTER))) {
+		smblib_dbg(chg, PR_OEM, "hvdcp detect or check_count = %d break\n",
+				check_count);
 		check_count = 0;
 		return;
 	}
@@ -11339,6 +10052,7 @@ static void smblib_charger_type_recheck(struct work_struct *work)
 		chg->precheck_charger_type = chg->real_charger_type;
 	chg->recheck_charger = true;
 
+	/* need request hsusb phy dpdm to false then true for float charger */
 	if (chg->real_charger_type == POWER_SUPPLY_TYPE_USB_FLOAT) {
 		rc = smblib_request_dpdm(chg, false);
 		if (rc < 0)
@@ -11353,7 +10067,6 @@ check_next:
 	schedule_delayed_work(&chg->charger_type_recheck,
 				msecs_to_jiffies(recheck_time));
 }
-#endif
 
 static char *dr_mode_text[] = {
 	"ufp", "dfp", "none"
@@ -11450,7 +10163,6 @@ static void smblib_dual_role_check_work(struct work_struct *work)
 	vote(chg->awake_votable, DR_SWAP_VOTER, false, 0);
 }
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 static void smblib_batt_verify_update_work(struct work_struct *work)
 {
 	struct smb_charger *chg = container_of(work, struct smb_charger,
@@ -11481,7 +10193,6 @@ static void smblib_batt_verify_update_work(struct work_struct *work)
 	}
 
 }
-#endif
 
 static int smblib_create_votables(struct smb_charger *chg)
 {
@@ -11551,7 +10262,6 @@ static int smblib_create_votables(struct smb_charger *chg)
 		return rc;
 	}
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	chg->dc_icl_votable = create_votable("DC_ICL", VOTE_MIN,
 					smblib_dc_icl_vote_callback,
 					chg);
@@ -11559,7 +10269,6 @@ static int smblib_create_votables(struct smb_charger *chg)
 		rc = PTR_ERR(chg->dc_icl_votable);
 		return rc;
 	}
-#endif
 
 	chg->awake_votable = create_votable("AWAKE", VOTE_SET_ANY,
 					smblib_awake_vote_callback,
@@ -11670,9 +10379,7 @@ int smblib_init(struct smb_charger *chg)
 	INIT_WORK(&chg->pl_update_work, pl_update_work);
 	INIT_WORK(&chg->jeita_update_work, jeita_update_work);
 	INIT_WORK(&chg->dcin_aicl_work, dcin_aicl_work);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	INIT_WORK(&chg->lpd_disable_chg_work, smblib_lpd_disable_chg_work);
-#endif
 	INIT_DELAYED_WORK(&chg->clear_hdc_work, clear_hdc_work);
 	INIT_DELAYED_WORK(&chg->icl_change_work, smblib_icl_change_work);
 	INIT_DELAYED_WORK(&chg->pl_enable_work, smblib_pl_enable_work);
@@ -11680,50 +10387,32 @@ int smblib_init(struct smb_charger *chg)
 	INIT_DELAYED_WORK(&chg->bb_removal_work, smblib_bb_removal_work);
 	INIT_DELAYED_WORK(&chg->lpd_ra_open_work, smblib_lpd_ra_open_work);
 	INIT_DELAYED_WORK(&chg->lpd_detach_work, smblib_lpd_detach_work);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	INIT_DELAYED_WORK(&chg->batt_verify_update_work, smblib_batt_verify_update_work);
-#endif
 	INIT_DELAYED_WORK(&chg->raise_qc3_vbus_work, smblib_raise_qc3_vbus_work);
 	INIT_DELAYED_WORK(&chg->charger_type_recheck, smblib_charger_type_recheck);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	INIT_DELAYED_WORK(&chg->six_pin_batt_step_chg_work,
 					smblib_six_pin_batt_step_chg_work);
-#endif
 	INIT_DELAYED_WORK(&chg->cc_un_compliant_charge_work,
 			smblib_cc_un_compliant_charge_work);
-#endif
+	INIT_DELAYED_WORK(&chg->reg_work, smblib_reg_work);
 	INIT_DELAYED_WORK(&chg->thermal_regulation_work,
 					smblib_thermal_regulation_work);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	INIT_DELAYED_WORK(&chg->dc_plug_out_delay_work, smblib_dc_plug_out_work);
-#endif
 	INIT_DELAYED_WORK(&chg->usbov_dbc_work, smblib_usbov_dbc_work);
 	INIT_DELAYED_WORK(&chg->role_reversal_check,
 					smblib_dual_role_check_work);
 	INIT_DELAYED_WORK(&chg->pr_swap_detach_work,
 					smblib_pr_swap_detach_work);
-#ifdef CONFIG_CHARGER_LN8000
-	INIT_DELAYED_WORK(&chg->check_vbat_work, smblib_check_vbat_work);
-#endif
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	if (chg->use_bq_pump) {
 		INIT_DELAYED_WORK(&chg->reduce_fcc_work, reduce_fcc_work);
 		INIT_DELAYED_WORK(&chg->thermal_setting_work, smblib_thermal_setting_work);
 	}
-#endif
 	INIT_DELAYED_WORK(&chg->pr_lock_clear_work,
 					smblib_pr_lock_clear_work);
-	if (chg->dcin_uusb_over_gpio_en)
-		INIT_DELAYED_WORK(&chg->micro_usb_switch_work,
-					smblib_micro_usb_switch_work);
-
 	setup_timer(&chg->apsd_timer, apsd_timer_cb, (unsigned long)chg);
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	INIT_DELAYED_WORK(&chg->report_soc_decimal_work, smblib_report_soc_decimal_work);
 	INIT_DELAYED_WORK(&chg->check_init_boot, smb_check_init_boot);
-#endif
 	if (chg->wa_flags & CHG_TERMINATION_WA) {
 		INIT_WORK(&chg->chg_termination_work,
 					smblib_chg_termination_work);
@@ -11750,9 +10439,7 @@ int smblib_init(struct smb_charger *chg)
 		}
 	}
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	chg->pps_thermal_level = -EINVAL;
-#endif
 
 	if (alarmtimer_get_rtcdev()) {
 		alarm_init(&chg->dcin_aicl_alarm, ALARM_REALTIME,
@@ -11770,14 +10457,10 @@ int smblib_init(struct smb_charger *chg)
 	chg->sec_chg_selected = POWER_SUPPLY_CHARGER_SEC_NONE;
 	chg->cp_reason = POWER_SUPPLY_CP_NONE;
 	chg->thermal_status = TEMP_BELOW_RANGE;
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	chg->batt_temp_irq_enabled = false;
-#endif
 	chg->dr_mode = DUAL_ROLE_PROP_MODE_NONE;
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	chg->esr_work_status = ESR_CHECK_FCC_NOLIMIT;
 	chg->hvdcp_recheck_status = false;
-#endif
 	chg->typec_irq_en = true;
 
 	switch (chg->mode) {
@@ -11806,7 +10489,7 @@ int smblib_init(struct smb_charger *chg)
 
 		chg->bms_psy = power_supply_get_by_name("bms");
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
+#ifdef CONFIG_BATT_VERIFY_BY_DS28E16
 		chg->batt_verify_psy = power_supply_get_by_name("batt_verify");
 #endif
 		if (chg->sec_pl_present) {
@@ -11886,28 +10569,18 @@ int smblib_deinit(struct smb_charger *chg)
 		cancel_delayed_work_sync(&chg->bb_removal_work);
 		cancel_delayed_work_sync(&chg->lpd_ra_open_work);
 		cancel_delayed_work_sync(&chg->lpd_detach_work);
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		cancel_delayed_work_sync(&chg->batt_verify_update_work);
-#endif
 		cancel_delayed_work_sync(&chg->raise_qc3_vbus_work);
 		cancel_delayed_work_sync(&chg->charger_type_recheck);
 		cancel_delayed_work_sync(&chg->cc_un_compliant_charge_work);
-#endif
+		cancel_delayed_work_sync(&chg->reg_work);
 		cancel_delayed_work_sync(&chg->thermal_regulation_work);
 		cancel_delayed_work_sync(&chg->usbov_dbc_work);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		cancel_delayed_work_sync(&chg->six_pin_batt_step_chg_work);
-#endif
 		cancel_delayed_work_sync(&chg->role_reversal_check);
 		cancel_delayed_work_sync(&chg->pr_swap_detach_work);
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 		cancel_delayed_work_sync(&chg->report_soc_decimal_work);
 		cancel_delayed_work_sync(&chg->check_init_boot);
-#endif
-#ifdef CONFIG_CHARGER_LN8000
-		cancel_delayed_work_sync(&chg->check_vbat_work);
-#endif
 		power_supply_unreg_notifier(&chg->nb);
 		smblib_destroy_votables(chg);
 		qcom_step_chg_deinit();
@@ -11925,7 +10598,6 @@ int smblib_deinit(struct smb_charger *chg)
 	return 0;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 static int __init early_parse_off_charge_flag(char *p)
 {
 	if (p) {
@@ -11936,4 +10608,3 @@ static int __init early_parse_off_charge_flag(char *p)
 	return 0;
 }
 early_param("androidboot.mode", early_parse_off_charge_flag);
-#endif

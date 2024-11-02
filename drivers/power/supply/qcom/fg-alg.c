@@ -277,8 +277,7 @@ int get_cycle_counts(struct cycle_counter *counter, const char **buf)
 	return 0;
 }
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
-/**
+ /**
  * set_cycle_count -
  * @counter: Cycle counter object
  * @value: The cycle count value to be set
@@ -298,9 +297,8 @@ int set_cycle_count(struct cycle_counter *counter, u16 count)
 
 	return 0;
 }
-#endif
 
-/**
+ /**
  * cycle_count_init -
  * @counter: Cycle counter object
  *

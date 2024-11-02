@@ -1348,7 +1348,6 @@ static int usb_icl_vote_callback(struct votable *votable, void *data,
 					== POWER_SUPPLY_PL_USBMID_USBMID)
 		cp_configure_ilim(chip, ICL_CHANGE_VOTER, icl_ua);
 
-#ifdef CONFIG_MACH_XIAOMI_SM8150
 	if (!chip->usb_psy)
 		chip->usb_psy = power_supply_get_by_name("usb");
 	if (!chip->usb_psy) {
@@ -1370,10 +1369,7 @@ static int usb_icl_vote_callback(struct votable *votable, void *data,
 			vote(chip->cp_ilim_votable, ICL_CHANGE_VOTER, false, 0);
 	}
 
-#if defined(CONFIG_MACH_XIAOMI_VAYU) || defined(CONFIG_MACH_XIAOMI_NABU)
 	cp_configure_ilim(chip, ICL_CHANGE_VOTER, icl_ua);
-#endif
-#endif
 
 	return 0;
 }
